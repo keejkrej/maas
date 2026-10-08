@@ -1,17 +1,26 @@
+import { type Access, privateRoot, zoneOf } from "../access.js";
 import type { AgentTool } from "../llm.js";
-import { repo, SOURCES_DIR } from "../repo.js";
+import type { MemoryRepo } from "../repo.js";
 
 const str = (description: string) => ({ type: "string", description });
 
-/** Read-only tools: used by recall and by the writer agents. */
-export function readTools(): AgentTool[] {
+function denyRead(access: Access, rel: string) {
+  return access.canRead(rel) ? null : `Error: ${rel} is outside your access (${access.label}).`;
+}
+function denyWrite(access: Access, rel: string) {
+  if (zoneOf(rel).kind === "source") return "Error: sources/ is read-only.";
+  return access.canWrite(rel) ? null : `Error: you may not write ${rel} (${access.label}).`;
+}
+
+/** Read-only tools, scoped to `access`. */
+export function readTools(repo: MemoryRepo, access: Access): AgentTool[] {
   return [
     {
       name: "list_files",
-      description: "List files in the memory repo (excluding raw sources). Optionally restrict to a folder.",
-      parameters: { type: "object", properties: { folder: str("Optional folder, e.g. 'people'") } },
+      description: "List memory files you can see (excluding raw sources), with entry counts. Optionally restrict to a folder.",
+      parameters: { type: "object", properties: { folder: str("Optional folder, e.g. 'projects' or 'private/alice'") } },
       async run({ folder }) {
-        const files = await repo.listFiles({ under: folder || undefined });
+        const files = await repo.listFiles({ access, under: folder || undefined });
         if (!files.length) return "(no files)";
         const lines = await Promise.all(
           files.map(async (f) => {
@@ -24,11 +33,14 @@ export function readTools(): AgentTool[] {
     },
     {
       name: "read_file",
-      description: "Read a file from the memory repo. Accepts paths like 'people/priya.md' or wiki links like '[[people/priya]]'.",
+      description: "Read a memory file. Accepts paths like 'people/priya.md' or wiki links like '[[people/priya]]'.",
       parameters: { type: "object", properties: { path: str("Repo-relative path") }, required: ["path"] },
       async run({ path }) {
-        const c = await repo.readFile(path);
-        if (c === null) return `File not found: ${path}`;
+        const rel = await repo.locate(path);
+        if (!rel) return `File not found: ${path}`;
+        const denied = denyRead(access, rel);
+        if (denied) return denied;
+        const c = (await repo.readFile(rel)) ?? "";
         return c
           .split("\n")
           .map((l, i) => `${String(i + 1).padStart(4)}| ${l}`)
@@ -38,43 +50,41 @@ export function readTools(): AgentTool[] {
     {
       name: "search",
       description:
-        "Case-insensitive regex search over all memory files (like grep -rni). Use several short searches with synonyms rather than one long one. Returns path:line: text.",
+        "Case-insensitive regex search over the memory files you can see (like grep -rni). Use several short searches with synonyms rather than one long one.",
       parameters: {
         type: "object",
         properties: {
           pattern: str("Regex or keyword, e.g. 'priya|pune'"),
-          include_sources: { type: "boolean", description: "Also search raw source observations (default false)" },
+          include_sources: { type: "boolean", description: "Also search raw observations you have access to (default false)" },
         },
         required: ["pattern"],
       },
       async run({ pattern, include_sources }) {
-        const hits = await repo.search(pattern, { includeSources: !!include_sources });
+        const hits = await repo.search(pattern, { access, includeSources: !!include_sources });
         if (!hits.length) return "No matches.";
         return hits.map((h) => `${h.path}:${h.line}: ${h.text}`).join("\n");
       },
     },
     {
       name: "read_source",
-      description:
-        "Open the raw observation behind a citation like [source: obs/<id>]. Use it to check provenance or resolve contradictions.",
-      parameters: { type: "object", properties: { id: str("Observation id, e.g. 'obs/k3x9q2' or 'k3x9q2'") }, required: ["id"] },
+      description: "Open the raw observation behind a citation like [source: obs/<id>]. Only works for observations you have access to.",
+      parameters: { type: "object", properties: { id: str("Observation id, e.g. 'obs/k3x9q2'") }, required: ["id"] },
       async run({ id }) {
-        const bare = String(id).replace(/^obs\//, "").trim();
-        const files = await repo.listFiles({ under: SOURCES_DIR, includeSources: true }).catch(() => []);
-        const match = files.find((f) => f.endsWith(`/${bare}.md`));
-        if (!match) return `No source found for ${id}`;
-        return (await repo.readFile(match)) ?? `No source found for ${id}`;
+        const f = await repo.findSource(id);
+        if (!f) return `No source found for ${id}`;
+        if (!access.canRead(f)) return `Source ${id} belongs to another member and is private.`;
+        return (await repo.readFile(f)) ?? `No source found for ${id}`;
       },
     },
   ];
 }
 
-/** Write tools for the ingest and dream agents. Changes stay uncommitted until the run finishes. */
-export function writeTools(): AgentTool[] {
+/** Write tools for ingest and dream runs. Changes stay uncommitted until the run finishes. */
+export function writeTools(repo: MemoryRepo, access: Access): AgentTool[] {
   return [
     {
       name: "write_file",
-      description: "Create or fully overwrite a markdown file in the memory repo. Prefer edit_file for small changes to existing files.",
+      description: "Create or fully overwrite a markdown file. Prefer edit_file for small changes to existing files.",
       parameters: {
         type: "object",
         properties: { path: str("Repo-relative path ending in .md"), content: str("Full file content") },
@@ -82,7 +92,8 @@ export function writeTools(): AgentTool[] {
       },
       async run({ path, content }) {
         const { rel } = repo.resolve(path);
-        if (rel.split("/")[0] === SOURCES_DIR) return "Error: sources/ is read-only";
+        const denied = denyWrite(access, rel);
+        if (denied) return denied;
         await repo.writeFile(rel, content);
         return `Wrote ${rel}`;
       },
@@ -90,17 +101,18 @@ export function writeTools(): AgentTool[] {
     {
       name: "edit_file",
       description:
-        "Replace an exact snippet in a file. old_text must match exactly once (copy it from read_file without the line-number prefix). Use an empty new_text to delete lines.",
+        "Replace an exact snippet in a file. old_text must match exactly once (copy it from read_file without the line-number prefix). Use empty new_text to delete.",
       parameters: {
         type: "object",
         properties: { path: str("Repo-relative path"), old_text: str("Exact text to replace"), new_text: str("Replacement text") },
         required: ["path", "old_text", "new_text"],
       },
       async run({ path, old_text, new_text }) {
-        const { rel } = repo.resolve(path);
-        if (rel.split("/")[0] === SOURCES_DIR) return "Error: sources/ is read-only";
-        const c = await repo.readFile(rel);
-        if (c === null) return `Error: file not found: ${rel}`;
+        const rel = await repo.locate(path);
+        if (!rel) return `Error: file not found: ${path}`;
+        const denied = denyWrite(access, rel);
+        if (denied) return denied;
+        const c = (await repo.readFile(rel)) ?? "";
         const count = c.split(old_text).length - 1;
         if (count === 0) return `Error: old_text not found in ${rel}. Re-read the file and copy the text exactly.`;
         if (count > 1) return `Error: old_text matches ${count} times in ${rel}; include more context.`;
@@ -112,7 +124,7 @@ export function writeTools(): AgentTool[] {
     },
     {
       name: "append_entry",
-      description: "Append one or more bullet lines to a file (creating it with a '# Title' heading if needed). Handy for adding facts.",
+      description: "Append bullet line(s) to a file, creating it with a '# Title' heading if needed.",
       parameters: {
         type: "object",
         properties: {
@@ -124,34 +136,39 @@ export function writeTools(): AgentTool[] {
       },
       async run({ path, lines, title }) {
         const { rel } = repo.resolve(path);
-        if (rel.split("/")[0] === SOURCES_DIR) return "Error: sources/ is read-only";
+        const denied = denyWrite(access, rel);
+        if (denied) return denied;
         const existing = await repo.readFile(rel);
         const base = existing ?? `# ${title || rel.replace(/\.md$/, "").split("/").pop()}\n\n`;
         await repo.writeFile(rel, base.replace(/\n*$/, "\n") + String(lines).trim() + "\n");
-        return `Appended to ${rel}${existing === null ? " (new file — remember to link it from MEMORY.md or a parent file)" : ""}`;
+        return `Appended to ${rel}${existing === null ? " (new file — link it from the relevant MEMORY.md index or a parent file)" : ""}`;
       },
     },
     {
       name: "move_file",
-      description: "Rename/move a file. You must update [[links]] that point to it yourself.",
+      description: "Rename/move a file. Update [[links]] that point to it yourself.",
       parameters: { type: "object", properties: { from: str("Current path"), to: str("New path") }, required: ["from", "to"] },
       async run({ from, to }) {
-        const c = await repo.readFile(from);
-        if (c === null) return `Error: file not found: ${from}`;
+        const src = await repo.locate(from);
+        if (!src) return `Error: file not found: ${from}`;
         const dst = repo.resolve(to).rel;
-        await repo.writeFile(dst, c);
-        await repo.deleteFile(repo.resolve(from).rel);
-        return `Moved ${from} -> ${dst}`;
+        const denied = denyWrite(access, src) ?? denyWrite(access, dst);
+        if (denied) return denied;
+        await repo.writeFile(dst, (await repo.readFile(src)) ?? "");
+        await repo.deleteFile(src);
+        return `Moved ${src} -> ${dst}`;
       },
     },
     {
       name: "delete_file",
-      description: "Delete a file from the memory repo (e.g. after merging it elsewhere). Fix links that pointed to it.",
+      description: "Delete a file (e.g. after merging it elsewhere). Fix links that pointed to it.",
       parameters: { type: "object", properties: { path: str("Repo-relative path") }, required: ["path"] },
       async run({ path }) {
-        const { rel } = repo.resolve(path);
+        const rel = await repo.locate(path);
+        if (!rel) return `Error: file not found: ${path}`;
         if (rel === "MEMORY.md") return "Error: MEMORY.md cannot be deleted";
-        if (rel.split("/")[0] === SOURCES_DIR) return "Error: sources/ is read-only";
+        const denied = denyWrite(access, rel);
+        if (denied) return denied;
         await repo.deleteFile(rel);
         return `Deleted ${rel}`;
       },
@@ -159,16 +176,42 @@ export function writeTools(): AgentTool[] {
   ];
 }
 
-/** Terminal tool that ends a writer run with a commit message. */
-export function commitTool(): AgentTool {
+/**
+ * Terminal tool for ingest runs. Separate messages for shared and personal changes, because they are
+ * committed separately and teammates can see shared commit messages but not personal ones.
+ */
+export function ingestCommitTool(): AgentTool {
   return {
     name: "commit",
     description:
-      "Finish your work. Provide a short commit message describing what changed in memory (or starting with 'no-op:' if nothing was worth saving).",
-    parameters: { type: "object", properties: { message: str("Commit message, imperative mood, <= 72 chars first line") }, required: ["message"] },
+      "Finish. Give a commit message for the shared team changes and, separately, one for personal changes. " +
+      "team_message must not reveal anything personal. Use 'no-op: <reason>' when nothing was saved in that space.",
+    parameters: {
+      type: "object",
+      properties: {
+        team_message: str("Commit message for changes outside private/ (or 'no-op: …')"),
+        personal_message: str("Commit message for changes in your private/ space (or 'no-op: …')"),
+      },
+      required: ["team_message", "personal_message"],
+    },
+    terminal: true,
+    async run({ team_message, personal_message }) {
+      return JSON.stringify({ team: String(team_message || "no-op"), personal: String(personal_message || "no-op") });
+    },
+  };
+}
+
+/** Terminal tool for dream runs (single scope). */
+export function commitTool(): AgentTool {
+  return {
+    name: "commit",
+    description: "Finish. Provide a short commit message describing what changed (or 'no-op: …' if nothing needed changing).",
+    parameters: { type: "object", properties: { message: str("Commit message, <= 72 chars first line") }, required: ["message"] },
     terminal: true,
     async run({ message }) {
       return String(message || "update memory").trim();
     },
   };
 }
+
+export { privateRoot };

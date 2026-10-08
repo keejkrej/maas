@@ -8,24 +8,21 @@ function env(name: string, fallback?: string): string | undefined {
 export const config = {
   port: Number(env("PORT", "8080")),
 
-  /** Shared secret clients must send (Authorization: Bearer <token>, or ?key=<token>). */
-  authToken: env("MAAS_TOKEN"),
+  /**
+   * Server admin token: creates teams and manages any team. Members authenticate with their own
+   * per-member API keys (issued via the admin API). MAAS_TOKEN is accepted as a legacy alias.
+   */
+  adminToken: env("MAAS_ADMIN_TOKEN", env("MAAS_TOKEN")),
 
-  /** Name of the person/team this memory belongs to (shown in MEMORY.md header). */
-  ownerName: env("MAAS_OWNER", "Owner")!,
+  /** Local working directory: teams/<id>/memory holds each team's git repo. Ephemeral on Cloud Run. */
+  dataDir: path.resolve(env("MAAS_DATA_DIR", ".data")!),
 
-  /** Local working copy of the memory repo. On Cloud Run this lives in the in-memory FS. */
-  repoDir: path.resolve(env("MAAS_REPO_DIR", ".data/memory")!),
-
-  /** Where the inbox journal lives locally (mirrored to GCS when configured). */
+  /** Blob store root for local dev (registry, inbox journals). Ignored when MAAS_GCS_BUCKET is set. */
   stateDir: path.resolve(env("MAAS_STATE_DIR", ".data/state")!),
 
-  /** GCS bucket used to persist the repo (as a git bundle) and the inbox journal. */
+  /** GCS bucket for durable state: team registry, inbox journals, git bundle snapshots. */
   gcsBucket: env("MAAS_GCS_BUCKET"),
   gcsPrefix: env("MAAS_GCS_PREFIX", "maas")!,
-
-  /** Optional git remote (e.g. a private GitHub repo with a token in the URL). Pushed after every commit. */
-  gitRemote: env("MAAS_GIT_REMOTE"),
 
   /** LLM settings. On Cloud Run we use Vertex AI with the service account (no API key). */
   llm: {
@@ -40,7 +37,7 @@ export const config = {
     maxSteps: Number(env("MAAS_MAX_AGENT_STEPS", "24")),
   },
 
-  /** Dream automatically after this many integrated observations (0 disables). Cloud Scheduler can also hit /dream. */
+  /** Dream automatically after this many integrated observations per team (0 disables). */
   dreamEvery: Number(env("MAAS_DREAM_EVERY", "25")),
 };
 

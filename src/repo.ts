@@ -3,16 +3,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { config } from "./config.js";
+import { META_DIR, SOURCES_DIR, type Access, zoneOf } from "./access.js";
 import { blobs } from "./storage.js";
 
 const exec = promisify(execFile);
-
-/** Directories inside the repo that the agent does not browse by default. */
-export const SOURCES_DIR = "sources";
-export const META_DIR = ".maas";
-const HIDDEN = new Set([".git", META_DIR]);
-const BUNDLE_KEY = "repo/memory.bundle";
 
 export interface CommitInfo {
   sha: string;
@@ -21,35 +15,35 @@ export interface CommitInfo {
   files: string[];
 }
 
-function today() {
+export interface Hit {
+  path: string;
+  line: number;
+  text: string;
+}
+
+export function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function seedMemory(owner: string) {
-  return `# Memory: ${owner}
-
-This file is the entry point to ${owner}'s memory. It is loaded at the start of every session,
-so it stays short: only what every session needs, plus links to topic files.
-
-## Core facts
-
-## Index
-`;
-}
-
 /**
- * The memory repo: a git repository of markdown, maintained by the memory agent.
- * All writes go through the agent's serial queue, so there is exactly one writer.
+ * One team's memory: a git repository of markdown, maintained by the memory agent.
+ * All writes go through the team's serial queue, so there is exactly one writer.
  */
 export class MemoryRepo {
-  readonly dir = config.repoDir;
+  constructor(
+    readonly dir: string,
+    /** Blob key of the git bundle snapshot. */
+    private bundleKey: string,
+    /** Returns the current git remote (may change at runtime via the admin API). */
+    private remote: () => string | undefined,
+  ) {}
 
   async git(args: string[], opts: { allowFail?: boolean } = {}): Promise<string> {
     try {
       const { stdout } = await exec(
         "git",
         ["-c", "user.name=maas-memory-agent", "-c", "user.email=agent@maas.local", "-c", "core.quotepath=off", ...args],
-        { cwd: this.dir, maxBuffer: 32 * 1024 * 1024 },
+        { cwd: this.dir, maxBuffer: 64 * 1024 * 1024 },
       );
       return stdout;
     } catch (e: any) {
@@ -58,48 +52,47 @@ export class MemoryRepo {
     }
   }
 
-  /** Restore from remote/bundle or create a fresh repo. */
-  async init() {
+  /** Restore from remote/bundle or create a fresh repo seeded with `seed` files. */
+  async init(seed: Record<string, string>) {
     await fs.mkdir(path.dirname(this.dir), { recursive: true });
     const hasGit = await fs
       .stat(path.join(this.dir, ".git"))
       .then(() => true)
       .catch(() => false);
+    const remote = this.remote();
 
     if (!hasGit) {
-      if (config.gitRemote && (await this.tryClone(config.gitRemote))) {
-        console.log(`[repo] cloned from git remote`);
-      } else if (blobs.kind === "gcs" && (await this.tryRestoreBundle())) {
-        console.log(`[repo] restored from GCS bundle`);
+      if (blobs.kind === "gcs" && (await this.tryRestoreBundle())) {
+        console.log(`[repo] ${this.dir}: restored from GCS bundle`);
+      } else if (remote && (await this.tryClone(remote))) {
+        console.log(`[repo] ${this.dir}: cloned from git remote`);
       } else {
         await fs.mkdir(this.dir, { recursive: true });
-        await this.git(["init", "-b", "main"]);
-        await this.writeFile("MEMORY.md", seedMemory(config.ownerName));
-        await this.commit("init: create memory repo");
-        await this.persist();
-        console.log(`[repo] initialised new memory repo at ${this.dir}`);
+        await this.git(["init", "-q", "-b", "main"]);
       }
     }
-    if (config.gitRemote) {
-      await this.git(["remote", "remove", "origin"], { allowFail: true });
-      await this.git(["remote", "add", "origin", config.gitRemote]);
+    const head = await this.git(["rev-parse", "--verify", "HEAD"], { allowFail: true });
+    if (!head.trim()) {
+      await this.git(["checkout", "-q", "-B", "main"], { allowFail: true });
+      for (const [p, c] of Object.entries(seed)) await this.writeFile(p, c, { allowMeta: true });
+      await this.commit("init: create memory repo");
+      await this.persist();
     }
+    await this.syncRemote();
+  }
+
+  async syncRemote() {
+    const remote = this.remote();
+    await this.git(["remote", "remove", "origin"], { allowFail: true });
+    if (remote) await this.git(["remote", "add", "origin", remote]);
   }
 
   private async tryClone(url: string) {
     try {
-      await exec("git", ["clone", url, this.dir]);
-      // An empty remote clones fine but has no commits; seed it.
-      const head = await this.git(["rev-parse", "--verify", "HEAD"], { allowFail: true });
-      if (!head.trim()) {
-        await this.git(["checkout", "-B", "main"]);
-        await this.writeFile("MEMORY.md", seedMemory(config.ownerName));
-        await this.commit("init: create memory repo");
-        await this.persist();
-      }
+      await exec("git", ["clone", "-q", url, this.dir]);
       return true;
     } catch (e) {
-      console.warn(`[repo] clone failed, falling back:`, (e as Error).message);
+      console.warn(`[repo] clone failed, starting fresh:`, (e as Error).message.replace(/\/\/[^@/]+@/g, "//***@"));
       await fs.rm(this.dir, { recursive: true, force: true });
       return false;
     }
@@ -107,8 +100,8 @@ export class MemoryRepo {
 
   private async tryRestoreBundle() {
     const tmp = path.join(os.tmpdir(), `maas-restore-${Date.now()}.bundle`);
-    if (!(await blobs.getFile(BUNDLE_KEY, tmp))) return false;
-    await exec("git", ["clone", "-b", "main", tmp, this.dir]);
+    if (!(await blobs.getFile(this.bundleKey, tmp))) return false;
+    await exec("git", ["clone", "-q", "-b", "main", tmp, this.dir]);
     await this.git(["remote", "remove", "origin"], { allowFail: true });
     await fs.rm(tmp, { force: true });
     return true;
@@ -116,30 +109,37 @@ export class MemoryRepo {
 
   /** Push the current state to durable storage. Called after every commit. */
   async persist() {
-    if (config.gitRemote) {
-      await this.git(["push", "-u", "origin", "HEAD:main"]).catch((e) =>
-        console.error(`[repo] push failed:`, e.message),
+    if (this.remote()) {
+      await this.git(["push", "-q", "-u", "origin", "HEAD:main"]).catch((e) =>
+        console.error(`[repo] push failed:`, e.message.replace(/\/\/[^@/]+@/g, "//***@")),
       );
     }
     if (blobs.kind === "gcs") {
-      const tmp = path.join(os.tmpdir(), `maas-${Date.now()}.bundle`);
-      await this.git(["bundle", "create", tmp, "main"]);
-      await blobs.putFile(BUNDLE_KEY, tmp);
+      const tmp = path.join(os.tmpdir(), `maas-${Date.now()}-${Math.random().toString(36).slice(2)}.bundle`);
+      await this.git(["bundle", "create", "-q", tmp, "main"]);
+      await blobs.putFile(this.bundleKey, tmp);
       await fs.rm(tmp, { force: true });
     }
   }
 
   // ---------- paths ----------
 
-  /** Normalise and validate a repo-relative path. Throws on escape attempts or hidden dirs. */
+  /** Normalise and validate a repo-relative path. */
   resolve(rel: string, opts: { allowMeta?: boolean } = {}): { rel: string; abs: string } {
-    let clean = rel.replace(/\\/g, "/").replace(/^\/+/, "").trim();
+    let clean = String(rel ?? "").replace(/\\/g, "/").replace(/^\/+/, "").trim();
     if (clean.startsWith("[[") && clean.endsWith("]]")) clean = clean.slice(2, -2);
     const norm = path.posix.normalize(clean);
     if (!norm || norm === "." || norm.startsWith("..")) throw new Error(`Invalid path: ${rel}`);
-    const top = norm.split("/")[0];
-    if (top === ".git" || (top === META_DIR && !opts.allowMeta)) throw new Error(`Path not allowed: ${rel}`);
+    if (zoneOf(norm).kind === "meta" && !(opts.allowMeta && norm.startsWith(META_DIR + "/"))) throw new Error(`Path not allowed: ${rel}`);
     return { rel: norm, abs: path.join(this.dir, ...norm.split("/")) };
+  }
+
+  /** Resolve a path or wiki link to an existing file path (adds .md if needed). */
+  async locate(rel: string): Promise<string | null> {
+    const { rel: r, abs } = this.resolve(rel);
+    if (await isFile(abs)) return r;
+    if (!r.endsWith(".md") && (await isFile(abs + ".md"))) return r + ".md";
+    return null;
   }
 
   // ---------- reads ----------
@@ -149,22 +149,12 @@ export class MemoryRepo {
     try {
       return await fs.readFile(abs, "utf8");
     } catch {
-      // Allow [[wiki-links]] without the .md extension.
-      if (!abs.endsWith(".md")) {
-        try {
-          return await fs.readFile(abs + ".md", "utf8");
-        } catch {}
-      }
       return null;
     }
   }
 
-  async exists(rel: string) {
-    return (await this.readFile(rel)) !== null;
-  }
-
-  /** All files (repo-relative, posix), excluding .git/.maas and optionally sources/. */
-  async listFiles(opts: { includeSources?: boolean; under?: string } = {}): Promise<string[]> {
+  /** Files (repo-relative, posix) visible to `access`. Raw sources are excluded unless asked for. */
+  async listFiles(opts: { access?: Access; includeSources?: boolean; under?: string } = {}): Promise<string[]> {
     const out: string[] = [];
     const walk = async (absDir: string, relDir: string) => {
       let entries;
@@ -175,10 +165,11 @@ export class MemoryRepo {
       }
       for (const e of entries) {
         const rel = relDir ? `${relDir}/${e.name}` : e.name;
-        if (!relDir && HIDDEN.has(e.name)) continue;
-        if (!relDir && e.name === SOURCES_DIR && !opts.includeSources) continue;
+        const z = zoneOf(rel);
+        if (z.kind === "meta") continue;
+        if (z.kind === "source" && !opts.includeSources) continue;
         if (e.isDirectory()) await walk(path.join(absDir, e.name), rel);
-        else out.push(rel);
+        else if (!opts.access || opts.access.canRead(rel)) out.push(rel);
       }
     };
     const start = opts.under ? this.resolve(opts.under) : { rel: "", abs: this.dir };
@@ -186,11 +177,8 @@ export class MemoryRepo {
     return out.sort();
   }
 
-  /** Case-insensitive regex (falls back to literal) search across the repo. */
-  async search(
-    pattern: string,
-    opts: { includeSources?: boolean; limit?: number } = {},
-  ): Promise<{ path: string; line: number; text: string }[]> {
+  /** Case-insensitive regex (falls back to literal) search across visible files. */
+  async search(pattern: string, opts: { access?: Access; includeSources?: boolean; limit?: number } = {}): Promise<Hit[]> {
     let re: RegExp;
     try {
       re = new RegExp(pattern, "i");
@@ -198,8 +186,8 @@ export class MemoryRepo {
       re = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
     }
     const limit = opts.limit ?? 80;
-    const hits: { path: string; line: number; text: string }[] = [];
-    for (const f of await this.listFiles({ includeSources: opts.includeSources })) {
+    const hits: Hit[] = [];
+    for (const f of await this.listFiles(opts)) {
       const content = await this.readFile(f);
       if (content === null) continue;
       const lines = content.split("\n");
@@ -213,7 +201,14 @@ export class MemoryRepo {
     return hits;
   }
 
-  // ---------- writes (only called from inside the agent's serial queue) ----------
+  /** Find the archived raw observation file for an id. */
+  async findSource(id: string): Promise<string | null> {
+    const bare = String(id).replace(/^obs\//, "").replace(/[^a-z0-9]/gi, "");
+    const files = await this.listFiles({ under: SOURCES_DIR, includeSources: true }).catch(() => [] as string[]);
+    return files.find((f) => f.endsWith(`/${bare}.md`)) ?? null;
+  }
+
+  // ---------- writes (only called from inside the team's serial queue) ----------
 
   async writeFile(rel: string, content: string, opts: { allowMeta?: boolean } = {}) {
     const { abs } = this.resolve(rel, opts);
@@ -224,7 +219,6 @@ export class MemoryRepo {
   async deleteFile(rel: string) {
     const { abs } = this.resolve(rel);
     await fs.rm(abs, { force: true });
-    // Clean up empty parent dirs.
     let dir = path.dirname(abs);
     while (dir.startsWith(this.dir) && dir !== this.dir) {
       const left = await fs.readdir(dir).catch(() => ["x"]);
@@ -236,21 +230,35 @@ export class MemoryRepo {
 
   /** Discard uncommitted changes (used when an agent run fails mid-way). */
   async rollback() {
-    await this.git(["reset", "--hard", "HEAD"], { allowFail: true });
-    await this.git(["clean", "-fd"], { allowFail: true });
+    await this.git(["reset", "-q", "--hard", "HEAD"], { allowFail: true });
+    await this.git(["clean", "-qfd"], { allowFail: true });
   }
 
+  /** Paths with uncommitted changes (including untracked and deleted files). */
   async changedFiles(): Promise<string[]> {
-    const out = await this.git(["status", "--porcelain", "-uall"]);
-    return out
-      .split("\n")
-      .filter(Boolean)
-      .map((l) => l.slice(3).trim());
+    const out = await this.git(["status", "--porcelain", "-z", "-uall"]);
+    const parts = out.split("\0").filter(Boolean);
+    const files: string[] = [];
+    for (let i = 0; i < parts.length; i++) {
+      const entry = parts[i];
+      files.push(entry.slice(3));
+      if (entry[0] === "R" || entry[0] === "C") i++; // skip rename source
+    }
+    return files;
   }
 
-  /** Stage everything and commit. Returns null when there is nothing to commit. */
-  async commit(message: string): Promise<CommitInfo | null> {
-    await this.git(["add", "-A"]);
+  /**
+   * Stage and commit. With `filter`, only matching changed files are committed (used to split
+   * private and shared changes into separate commits). Returns null when nothing changed.
+   */
+  async commit(message: string, filter?: (rel: string) => boolean): Promise<CommitInfo | null> {
+    if (filter) {
+      const selected = (await this.changedFiles()).filter(filter);
+      if (!selected.length) return null;
+      await this.git(["add", "-A", "--", ...selected]);
+    } else {
+      await this.git(["add", "-A"]);
+    }
     const staged = await this.git(["diff", "--cached", "--name-only"]);
     const files = staged.split("\n").filter(Boolean);
     if (!files.length) return null;
@@ -259,38 +267,43 @@ export class MemoryRepo {
     return { sha, message, date: new Date().toISOString(), files };
   }
 
-  async log(limit = 20): Promise<CommitInfo[]> {
+  async head(): Promise<string> {
+    return (await this.git(["rev-parse", "--short", "HEAD"], { allowFail: true })).trim();
+  }
+
+  /** Unified diff since `sha` restricted to pathspecs (git pathspec magic allowed). */
+  async diffSince(sha: string | null, pathspecs: string[], maxChars = 40_000): Promise<string> {
+    const base = sha || (await this.git(["rev-list", "--max-parents=0", "HEAD"])).trim().split("\n")[0];
+    const out = await this.git(["diff", "--no-color", `${base}..HEAD`, "--", ...pathspecs], { allowFail: true });
+    return out.length > maxChars ? out.slice(0, maxChars) + `\n…[diff truncated]` : out;
+  }
+
+  async log(limit = 50): Promise<CommitInfo[]> {
     const sep = "\u001f";
-    const out = await this.git(
-      ["log", `-n${limit}`, `--pretty=format:%x1e%h${sep}%aI${sep}%B`, "--name-only"],
-      { allowFail: true },
-    );
+    const out = await this.git(["log", `-n${limit}`, "--pretty=format:%x1e%h%x1f%aI%x1f%B%x1f", "--name-only"]);
     return out
       .split("\u001e")
       .filter((c) => c.trim())
       .map((chunk) => {
-        const [sha, date, rest] = chunk.split(sep);
-        // %B is followed by a blank line then file names.
-        const parts = (rest ?? "").replace(/\n+$/, "").split("\n\n");
-        const files = parts.length > 1 ? parts.pop()!.split("\n").filter(Boolean) : [];
-        return { sha, date, message: parts.join("\n\n").trim(), files };
+        const [sha, date, body, names] = chunk.split(sep);
+        return { sha, date, message: (body ?? "").trim(), files: (names ?? "").split("\n").map((s) => s.trim()).filter(Boolean) };
       });
   }
 
-  async show(sha: string): Promise<string> {
+  async show(sha: string, pathspecs: string[] = []): Promise<string> {
     if (!/^[0-9a-f]{4,40}$/i.test(sha)) throw new Error("bad sha");
-    return this.git(["show", "--stat", "--patch", "--format=%h %aI%n%n%B", sha]);
+    return this.git(["show", "--no-color", "--stat", "--patch", "--format=%h %aI%n%n%B", sha, "--", ...pathspecs]);
   }
 
   // ---------- meta state (inside the repo so it persists with it) ----------
 
-  async readMeta<T>(name: string, fallback: T): Promise<T> {
+  async readMeta<T extends object>(name: string, fallback: T): Promise<T> {
     const raw = await this.readFile(`${META_DIR}/${name}.json`, { allowMeta: true });
-    if (!raw) return fallback;
+    if (!raw) return structuredClone(fallback);
     try {
-      return { ...fallback, ...JSON.parse(raw) };
+      return { ...structuredClone(fallback), ...JSON.parse(raw) };
     } catch {
-      return fallback;
+      return structuredClone(fallback);
     }
   }
 
@@ -299,5 +312,9 @@ export class MemoryRepo {
   }
 }
 
-export { today };
-export const repo = new MemoryRepo();
+async function isFile(abs: string) {
+  return fs
+    .stat(abs)
+    .then((s) => s.isFile())
+    .catch(() => false);
+}

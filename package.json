@@ -1,0 +1,34 @@
+{
+  "name": "maas",
+  "version": "0.1.0",
+  "description": "Memory as a Service: an MCP endpoint backed by a memory agent that curates a git repo of markdown.",
+  "type": "module",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "smoke": "tsx scripts/smoke.ts"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@google-cloud/storage": "^8.3.0",
+    "@google/genai": "^2.28.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "express": "^5.2.1",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.4",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}

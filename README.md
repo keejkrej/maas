@@ -193,7 +193,7 @@ To run locally against a real Firestore, set `MAAS_STORE=firestore` and `GOOGLE_
 | `OLLAMA_API_KEY` | — | Ollama Cloud API key. A secret on Firebase. |
 | `MAAS_ADMIN_TOKEN` | — | Server admin token: create teams and manage any team. It can't act as a member on `/mcp`. A secret on Firebase. |
 | `MAAS_LLM_URL` | `https://ollama.com` | Any Ollama-API endpoint, e.g. a self-hosted Ollama. |
-| `MAAS_AGENT_MODEL` / `MAAS_DREAM_MODEL` | `gpt-oss:120b` | Models for ingest/recall and for dreaming. They need tool calling. |
+| `MAAS_AGENT_MODEL` / `MAAS_DREAM_MODEL` | `glm-5.3-flash` | Models for ingest/recall and for dreaming. They need tool calling. |
 | `MAAS_DREAM_EVERY` | `25` | Auto-dream after N observations per team (`0` = off). |
 | `MAAS_MAX_AGENT_STEPS` | `24` | Tool-call budget per agent run. |
 | `MAAS_STORE` | `firestore` on Firebase, else `local` | Storage backend. |

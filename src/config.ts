@@ -36,11 +36,11 @@ export const config = {
     },
     /** Model for ingest + recall. */
     get agentModel() {
-      return env("MAAS_AGENT_MODEL", "gpt-oss:120b")!;
+      return env("MAAS_AGENT_MODEL", "glm-5.3-flash")!;
     },
     /** Model for dreaming (consolidation); a stronger model helps. */
     get dreamModel() {
-      return env("MAAS_DREAM_MODEL", env("MAAS_AGENT_MODEL", "gpt-oss:120b"))!;
+      return env("MAAS_DREAM_MODEL", env("MAAS_AGENT_MODEL", "glm-5.3-flash"))!;
     },
     get maxSteps() {
       return Number(env("MAAS_MAX_AGENT_STEPS", "24"));

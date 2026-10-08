@@ -1,13 +1,14 @@
 import crypto from "node:crypto";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { hub } from "./agent/agent.js";
+import { memberAccess } from "./access.js";
+import * as agent from "./agent/agent.js";
 import { config } from "./config.js";
 import { buildMcpServer } from "./mcp.js";
 import { HttpError, publicMember, publicTeam, registry, type Member, type Team } from "./teams.js";
 import { viewerRouter } from "./web.js";
 
-const app = express();
+export const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", true);
 app.use(express.json({ limit: "2mb" }));
@@ -38,18 +39,22 @@ function tokenFrom(req: Request): string | undefined {
   return cookie ? decodeURIComponent(cookie[1]) : undefined;
 }
 
-export function resolveAuth(token: string | undefined): Auth | null {
+export async function resolveAuth(token: string | undefined): Promise<Auth | null> {
   if (!token) return null;
-  if (config.adminToken && safeEqual(token, config.adminToken)) return { kind: "admin" };
-  const id = registry.authenticate(token);
+  const admin = config.adminToken;
+  if (admin && safeEqual(token, admin)) return { kind: "admin" };
+  const id = await registry.authenticate(token);
   return id ? { kind: "member", team: id.team, member: id.member } : null;
 }
 
 function authenticate(req: Request, res: Response, next: NextFunction) {
-  const auth = resolveAuth(tokenFrom(req));
-  if (!auth) return void res.status(401).json({ error: "unauthorized: send your member API key as 'Authorization: Bearer <key>'" });
-  req.maas = auth;
-  next();
+  resolveAuth(tokenFrom(req))
+    .then((auth) => {
+      if (!auth) return void res.status(401).json({ error: "unauthorized: send your member API key as 'Authorization: Bearer <key>'" });
+      req.maas = auth;
+      next();
+    })
+    .catch(next);
 }
 
 function requireMember(req: Request, res: Response, next: NextFunction) {
@@ -89,8 +94,7 @@ async function handleMcp(req: Request, res: Response) {
     (typeof req.query.client === "string" ? req.query.client : "") ||
     (req.headers["user-agent"] ?? "unknown").split(" ")[0];
   try {
-    const tm = await hub.get(auth.team.id);
-    const server = buildMcpServer({ tm, member: auth.member, client });
+    const server = buildMcpServer({ team: auth.team, member: auth.member, client });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on("close", () => {
       transport.close().catch(() => {});
@@ -120,36 +124,30 @@ app.get("/api/me", authenticate, api(async (req) => {
 }));
 
 app.get("/api/teams", authenticate, api(async (req) => {
-  if (isServerAdmin(req)) return registry.list().map(publicTeam);
+  if (isServerAdmin(req)) return (await registry.list()).map(publicTeam);
   const a = req.maas as Extract<Auth, { kind: "member" }>;
   return [publicTeam(a.team)];
 }));
 
 app.post("/api/teams", authenticate, api(async (req, res) => {
   guard(isServerAdmin(req));
-  const { id, name, gitRemote, admin } = req.body ?? {};
+  const { id, name, admin } = req.body ?? {};
   if (!id || !admin?.id) throw new HttpError(400, "body must include id and admin: { id, name }");
-  const out = await registry.createTeam({ id, name, gitRemote, admin });
-  await hub.get(out.team.id); // initialise the repo
+  const out = await registry.createTeam({ id, name, admin });
+  await agent.initTeamMemory(out.team);
   res.status(201);
   return { team: publicTeam(out.team), member: publicMember(out.member), key: out.key };
 }));
 
 app.get("/api/teams/:team", authenticate, api(async (req) => {
   guard(isTeamMember(req, req.params.team as string));
-  return publicTeam(registry.get(req.params.team as string));
+  return publicTeam(await registry.get(req.params.team as string));
 }));
 
 app.patch("/api/teams/:team", authenticate, api(async (req) => {
   const teamId = req.params.team as string;
   guard(isTeamAdmin(req, teamId));
-  const team = await registry.updateTeam(teamId, { name: req.body?.name, gitRemote: req.body?.gitRemote });
-  if (req.body?.gitRemote !== undefined) {
-    const tm = await hub.get(teamId);
-    await tm.repo.syncRemote();
-    await tm.repo.persist();
-  }
-  return publicTeam(team);
+  return publicTeam(await registry.updateTeam(teamId, { name: req.body?.name }));
 }));
 
 app.post("/api/teams/:team/members", authenticate, api(async (req, res) => {
@@ -188,65 +186,64 @@ app.delete("/api/teams/:team/members/:member", authenticate, api(async (req) => 
 app.post("/api/teams/:team/dream", authenticate, api(async (req) => {
   const teamId = req.params.team as string;
   guard(isTeamAdmin(req, teamId));
-  (await hub.get(teamId)).dream("requested via API", true).catch((e) => console.error("[dream]", e));
-  return { started: true };
+  await registry.get(teamId);
+  const item = await agent.requestDream(teamId, "requested via API", true);
+  return { queued: item.id };
+}));
+
+/**
+ * Markdown export. Members get the shared space + their own personal space;
+ * the server admin token gets the shared space only (personal memory stays with its owner).
+ */
+app.get("/api/teams/:team/files", authenticate, api(async (req) => {
+  const teamId = req.params.team as string;
+  guard(isTeamMember(req, teamId));
+  await registry.get(teamId);
+  const store = await agent.readStore(teamId);
+  const access = req.maas?.kind === "member" ? memberAccess(req.maas.member.id) : null;
+  const paths = (await store.listFiles(access ? { access } : {})).filter((p) => (access ? true : !p.startsWith("private/")));
+  const files: Record<string, string> = {};
+  for (const p of paths) files[p] = (await store.readFile(p)) ?? "";
+  return { team: teamId, head: await store.head(), files };
 }));
 
 // ---------- ops ----------
 
-app.get("/healthz", api(async () => ({ ok: true, teams: registry.list().length })));
+app.get("/healthz", api(async () => ({ ok: true, store: config.useFirestore ? "firestore" : "local", model: config.llm.agentModel })));
 
-/** Cloud Scheduler hits this nightly (admin token) to dream every team. */
+/** Admin: queue a dream for every team (the nightly schedule does this on Firebase). */
 app.post("/dream", authenticate, api(async (req) => {
   guard(isServerAdmin(req));
-  hub.dreamAll("scheduled").catch((e) => console.error("[dream]", e));
-  return { started: true, teams: registry.list().length };
+  await agent.dreamAll("requested via API");
+  return { queued: true, teams: (await registry.list()).length };
 }));
 
 // ---------- viewer (member key, stored in a cookie) ----------
 
-app.get("/", (_req, res) => res.redirect("/view"));
+app.get("/", (_req, res) => res.redirect("view"));
 app.use(
   "/view",
   (req, res, next) => {
-    if (typeof req.query.key === "string" && resolveAuth(req.query.key)?.kind === "member") {
-      res.cookie("maas_key", req.query.key, { httpOnly: true, secure: req.secure, sameSite: "lax", maxAge: 90 * 864e5 });
-      return res.redirect(req.baseUrl + req.path);
-    }
-    const auth = resolveAuth(tokenFrom(req));
-    if (auth?.kind !== "member") {
-      return res.status(401).send(`<form style="font:16px system-ui;margin:20vh auto;width:340px" method="get">
+    (async () => {
+      if (typeof req.query.key === "string" && (await resolveAuth(req.query.key))?.kind === "member") {
+        res.cookie("maas_key", req.query.key, { httpOnly: true, secure: req.secure, sameSite: "lax", maxAge: 90 * 864e5 });
+        const rest = new URLSearchParams(req.query as Record<string, string>);
+        rest.delete("key");
+        const qs = rest.toString();
+        return res.redirect((req.path === "/" ? "./" : req.path.slice(1)) + (qs ? `?${qs}` : ""));
+      }
+      const auth = await resolveAuth(tokenFrom(req));
+      if (auth?.kind !== "member") {
+        return res.status(401).send(`<form style="font:16px system-ui;margin:20vh auto;width:340px" method="get">
         <p>🧠 maas — enter your member API key</p><input name="key" type="password" style="width:100%;padding:8px" autofocus></form>`);
-    }
-    req.maas = auth;
-    next();
+      }
+      req.maas = auth;
+      next();
+    })().catch(next);
   },
   viewerRouter(),
 );
 app.get("/logout", (_req, res) => {
   res.clearCookie("maas_key");
-  res.redirect("/view");
+  res.redirect("view");
 });
-
-// ---------- boot ----------
-
-async function main() {
-  if (!config.adminToken) console.warn("[maas] MAAS_ADMIN_TOKEN is not set — team creation via the API is disabled");
-  await hub.start();
-  app.listen(config.port, () => {
-    console.log(`[maas] listening on :${config.port}  (MCP: /mcp, API: /api, viewer: /view)  model=${config.llm.agentModel} vertex=${config.llm.useVertex}`);
-  });
-}
-
-main().catch((e) => {
-  console.error("[maas] fatal", e);
-  process.exit(1);
-});
-
-for (const sig of ["SIGTERM", "SIGINT"] as const) {
-  process.on(sig, () => {
-    console.log(`[maas] ${sig} received, exiting`);
-    // Pending observations are journaled in the blob store and recovered on next boot.
-    process.exit(0);
-  });
-}

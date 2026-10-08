@@ -5,40 +5,52 @@ function env(name: string, fallback?: string): string | undefined {
   return v === undefined || v === "" ? fallback : v;
 }
 
+const onFirebase = !!(process.env.K_SERVICE || process.env.FUNCTION_TARGET || process.env.FIREBASE_CONFIG);
+
+/** Read lazily: on Firebase, secrets are injected as env vars at runtime. */
 export const config = {
-  port: Number(env("PORT", "8080")),
-
-  /**
-   * Server admin token: creates teams and manages any team. Members authenticate with their own
-   * per-member API keys (issued via the admin API). MAAS_TOKEN is accepted as a legacy alias.
-   */
-  adminToken: env("MAAS_ADMIN_TOKEN", env("MAAS_TOKEN")),
-
-  /** Local working directory: teams/<id>/memory holds each team's git repo. Ephemeral on Cloud Run. */
-  dataDir: path.resolve(env("MAAS_DATA_DIR", ".data")!),
-
-  /** Blob store root for local dev (registry, inbox journals). Ignored when MAAS_GCS_BUCKET is set. */
-  stateDir: path.resolve(env("MAAS_STATE_DIR", ".data/state")!),
-
-  /** GCS bucket for durable state: team registry, inbox journals, git bundle snapshots. */
-  gcsBucket: env("MAAS_GCS_BUCKET"),
-  gcsPrefix: env("MAAS_GCS_PREFIX", "maas")!,
-
-  /** LLM settings. On Cloud Run we use Vertex AI with the service account (no API key). */
-  llm: {
-    useVertex: env("GOOGLE_GENAI_USE_VERTEXAI", env("GEMINI_API_KEY") ? "false" : "true") === "true",
-    apiKey: env("GEMINI_API_KEY"),
-    project: env("GOOGLE_CLOUD_PROJECT"),
-    location: env("GOOGLE_CLOUD_LOCATION", "global")!,
-    /** Model used to integrate new observations and answer recall queries. */
-    agentModel: env("MAAS_AGENT_MODEL", "gemini-3.5-flash")!,
-    /** Model used for the periodic dreaming/consolidation pass. */
-    dreamModel: env("MAAS_DREAM_MODEL", env("MAAS_AGENT_MODEL", "gemini-3.5-flash"))!,
-    maxSteps: Number(env("MAAS_MAX_AGENT_STEPS", "24")),
+  get port() {
+    return Number(env("PORT", "8080"));
   },
 
-  /** Dream automatically after this many integrated observations per team (0 disables). */
-  dreamEvery: Number(env("MAAS_DREAM_EVERY", "25")),
+  /** Server admin token: creates teams and manages any team. Members use their own API keys. */
+  get adminToken() {
+    return env("MAAS_ADMIN_TOKEN");
+  },
+
+  /** Firestore in production (on Firebase or when MAAS_STORE=firestore), local JSON file otherwise. */
+  useFirestore: env("MAAS_STORE", onFirebase ? "firestore" : "local") === "firestore",
+
+  /** True when running as Firebase Functions (work is triggered by Firestore events, not in-process). */
+  onFirebase,
+
+  dataDir: path.resolve(env("MAAS_DATA_DIR", ".data")!),
+
+  /** LLM: Ollama API (Ollama Cloud by default; point MAAS_LLM_URL at http://localhost:11434 for local Ollama). */
+  llm: {
+    get baseUrl() {
+      return env("MAAS_LLM_URL", "https://ollama.com")!.replace(/\/+$/, "");
+    },
+    get apiKey() {
+      return env("OLLAMA_API_KEY");
+    },
+    /** Model for ingest + recall. */
+    get agentModel() {
+      return env("MAAS_AGENT_MODEL", "gpt-oss:120b")!;
+    },
+    /** Model for dreaming (consolidation); a stronger model helps. */
+    get dreamModel() {
+      return env("MAAS_DREAM_MODEL", env("MAAS_AGENT_MODEL", "gpt-oss:120b"))!;
+    },
+    get maxSteps() {
+      return Number(env("MAAS_MAX_AGENT_STEPS", "24"));
+    },
+  },
+
+  /** Queue a dream after this many integrated observations per team (0 disables). */
+  get dreamEvery() {
+    return Number(env("MAAS_DREAM_EVERY", "25"));
+  },
 };
 
 export type Config = typeof config;

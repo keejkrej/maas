@@ -1,0 +1,15 @@
+{
+  "functions": [
+    {
+      "source": ".",
+      "codebase": "default",
+      "runtime": "nodejs22",
+      "predeploy": ["npm run build"],
+      "ignore": ["node_modules", ".git", ".data", "src", "scripts", "memory-*", "*.log", "firebase-debug.log", "README.md"]
+    }
+  ],
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  }
+}

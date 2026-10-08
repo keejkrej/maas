@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { blobs } from "./storage.js";
+import { db } from "./db.js";
 
 export type Role = "admin" | "member";
 
@@ -19,20 +19,12 @@ export interface Team {
   id: string;
   name: string;
   createdAt: string;
-  /** Optional git remote the team's memory repo is pushed to after each commit. */
-  gitRemote?: string;
   members: Member[];
 }
 
 export interface Identity {
   team: Team;
   member: Member;
-}
-
-const ID_RE = /^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$|^[a-z0-9]$/;
-
-export function validateId(id: string, what: string) {
-  if (!ID_RE.test(id)) throw new HttpError(400, `${what} id must be lowercase letters, digits and dashes (1-40 chars): '${id}'`);
 }
 
 export class HttpError extends Error {
@@ -44,76 +36,97 @@ export class HttpError extends Error {
   }
 }
 
+const ID_RE = /^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$/;
+export function validateId(id: string, what: string) {
+  if (!ID_RE.test(id ?? "")) throw new HttpError(400, `${what} id must be lowercase letters, digits and dashes (1-40 chars): '${id}'`);
+}
+
 const hash = (key: string) => crypto.createHash("sha256").update(key).digest("hex");
 const newKey = () => `maas_${crypto.randomBytes(24).toString("base64url")}`;
+const teamPath = (id: string) => `teams/${id}`;
+const keyPath = (h: string) => `keys/${h}`;
 
-/** Teams and member API keys. Small enough to keep in memory; persisted per team in the blob store. */
+export const activeMembers = (t: Team) => t.members.filter((m) => !m.revokedAt);
+const activeAdmins = (t: Team) => activeMembers(t).filter((m) => m.role === "admin");
+
+/**
+ * Teams and member API keys, stored in Firestore (`teams/{id}`, `keys/{sha256}`).
+ * Serverless instances cache team docs briefly; revocations propagate within CACHE_MS.
+ */
+const CACHE_MS = 15_000;
+
 export class Registry {
-  private teams = new Map<string, Team>();
-  private byHash = new Map<string, { teamId: string; memberId: string }>();
+  private cache = new Map<string, { at: number; team: Team }>();
+  private keyCache = new Map<string, { at: number; teamId: string; memberId: string } | { at: number; miss: true }>();
 
-  async load() {
-    for (const key of await blobs.list("registry/teams")) {
-      const raw = await blobs.get(key);
-      if (!raw) continue;
-      const team = JSON.parse(raw.toString("utf8")) as Team;
-      this.teams.set(team.id, team);
-    }
-    this.reindex();
-    console.log(`[registry] ${this.teams.size} team(s) loaded`);
+  private remember(team: Team) {
+    this.cache.set(team.id, { at: Date.now(), team });
+    return team;
   }
 
-  private reindex() {
-    this.byHash.clear();
-    for (const t of this.teams.values())
-      for (const m of t.members) if (!m.revokedAt) this.byHash.set(m.keyHash, { teamId: t.id, memberId: m.id });
+  async find(teamId: string): Promise<Team | null> {
+    const c = this.cache.get(teamId);
+    if (c && Date.now() - c.at < CACHE_MS) return c.team;
+    const t = await db.get<Team>(teamPath(teamId));
+    if (t) this.remember(t);
+    return t;
   }
 
-  private async save(team: Team) {
-    await blobs.put(`registry/teams/${team.id}.json`, JSON.stringify(team, null, 2));
-    this.reindex();
-  }
-
-  authenticate(key: string): Identity | null {
-    const hit = this.byHash.get(hash(key));
-    if (!hit) return null;
-    const team = this.teams.get(hit.teamId)!;
-    const member = team.members.find((m) => m.id === hit.memberId)!;
-    return { team, member };
-  }
-
-  list(): Team[] {
-    return [...this.teams.values()];
-  }
-
-  get(teamId: string): Team {
-    const t = this.teams.get(teamId);
+  async get(teamId: string): Promise<Team> {
+    const t = await this.find(teamId);
     if (!t) throw new HttpError(404, `team not found: ${teamId}`);
     return t;
   }
 
-  async createTeam(input: { id: string; name?: string; gitRemote?: string; admin: { id: string; name?: string } }) {
-    validateId(input.id, "team");
-    if (this.teams.has(input.id)) throw new HttpError(409, `team already exists: ${input.id}`);
-    const team: Team = { id: input.id, name: input.name || input.id, createdAt: new Date().toISOString(), gitRemote: input.gitRemote, members: [] };
-    this.teams.set(team.id, team);
-    const { member, key } = await this.addMember(team.id, { ...input.admin, role: "admin" });
-    return { team, member, key };
+  async list(): Promise<Team[]> {
+    return (await db.list<Team>("teams")).map((r) => this.remember(r.data));
   }
 
-  async updateTeam(teamId: string, patch: { name?: string; gitRemote?: string | null }) {
-    const team = this.get(teamId);
-    if (patch.name) team.name = patch.name;
-    if (patch.gitRemote !== undefined) team.gitRemote = patch.gitRemote || undefined;
-    await this.save(team);
-    return team;
+  async authenticate(key: string): Promise<Identity | null> {
+    if (!key?.startsWith("maas_")) return null;
+    const h = hash(key);
+    let k = this.keyCache.get(h);
+    if (!k || Date.now() - k.at > CACHE_MS) {
+      const doc = await db.get<{ teamId: string; memberId: string }>(keyPath(h));
+      k = doc ? { at: Date.now(), ...doc } : { at: Date.now(), miss: true };
+      this.keyCache.set(h, k);
+    }
+    if ("miss" in k) return null;
+    const team = await this.find(k.teamId);
+    const member = team?.members.find((m) => m.id === k.memberId && m.keyHash === h && !m.revokedAt);
+    return team && member ? { team, member } : null;
+  }
+
+  /** Transactionally mutate a team doc. */
+  private async mutate(teamId: string, fn: (t: Team) => void): Promise<Team> {
+    const out = await db.update<Team>(teamPath(teamId), (cur) => {
+      if (!cur) throw new HttpError(404, `team not found: ${teamId}`);
+      fn(cur);
+      return cur;
+    });
+    return this.remember(out!);
+  }
+
+  async createTeam(input: { id: string; name?: string; admin: { id: string; name?: string } }) {
+    validateId(input.id, "team");
+    validateId(input.admin?.id, "member");
+    const team: Team = { id: input.id, name: input.name || input.id, createdAt: new Date().toISOString(), members: [] };
+    await db.update<Team>(teamPath(team.id), (cur) => {
+      if (cur) throw new HttpError(409, `team already exists: ${team.id}`);
+      return team;
+    });
+    const { member, key } = await this.addMember(team.id, { ...input.admin, role: "admin" });
+    return { team: await this.get(team.id), member, key };
+  }
+
+  async updateTeam(teamId: string, patch: { name?: string }) {
+    return this.mutate(teamId, (t) => {
+      if (patch.name) t.name = patch.name;
+    });
   }
 
   async addMember(teamId: string, input: { id: string; name?: string; role?: Role }) {
     validateId(input.id, "member");
-    const team = this.get(teamId);
-    const existing = team.members.find((m) => m.id === input.id);
-    if (existing && !existing.revokedAt) throw new HttpError(409, `member already exists: ${input.id}`);
     const key = newKey();
     const member: Member = {
       id: input.id,
@@ -123,47 +136,67 @@ export class Registry {
       keyPrefix: key.slice(0, 10),
       createdAt: new Date().toISOString(),
     };
-    // Re-adding a revoked member keeps their id (and their private memory).
-    team.members = team.members.filter((m) => m.id !== input.id).concat(member);
-    await this.save(team);
+    let oldHash: string | undefined;
+    await this.mutate(teamId, (t) => {
+      const existing = t.members.find((m) => m.id === input.id);
+      if (existing && !existing.revokedAt) throw new HttpError(409, `member already exists: ${input.id}`);
+      oldHash = existing?.keyHash;
+      // Re-adding a revoked member keeps their id (and their private memory).
+      t.members = t.members.filter((m) => m.id !== input.id).concat(member);
+    });
+    await db.batch([
+      ...(oldHash ? [{ op: "delete" as const, path: keyPath(oldHash) }] : []),
+      { op: "set", path: keyPath(member.keyHash), data: { teamId, memberId: member.id } },
+    ]);
     return { member, key };
   }
 
   async rotateKey(teamId: string, memberId: string) {
-    const team = this.get(teamId);
-    const m = team.members.find((x) => x.id === memberId && !x.revokedAt);
-    if (!m) throw new HttpError(404, `member not found: ${memberId}`);
     const key = newKey();
-    m.keyHash = hash(key);
-    m.keyPrefix = key.slice(0, 10);
-    await this.save(team);
-    return { member: m, key };
+    let oldHash = "";
+    let member!: Member;
+    await this.mutate(teamId, (t) => {
+      const m = t.members.find((x) => x.id === memberId && !x.revokedAt);
+      if (!m) throw new HttpError(404, `member not found: ${memberId}`);
+      oldHash = m.keyHash;
+      m.keyHash = hash(key);
+      m.keyPrefix = key.slice(0, 10);
+      member = m;
+    });
+    this.keyCache.delete(oldHash);
+    await db.batch([
+      { op: "delete", path: keyPath(oldHash) },
+      { op: "set", path: keyPath(member.keyHash), data: { teamId, memberId } },
+    ]);
+    return { member, key };
   }
 
   async setRole(teamId: string, memberId: string, role: Role) {
-    const team = this.get(teamId);
-    const m = team.members.find((x) => x.id === memberId && !x.revokedAt);
-    if (!m) throw new HttpError(404, `member not found: ${memberId}`);
-    if (m.role === "admin" && role !== "admin" && activeAdmins(team).length <= 1)
-      throw new HttpError(400, "a team needs at least one admin");
-    m.role = role;
-    await this.save(team);
-    return m;
+    let member!: Member;
+    await this.mutate(teamId, (t) => {
+      const m = t.members.find((x) => x.id === memberId && !x.revokedAt);
+      if (!m) throw new HttpError(404, `member not found: ${memberId}`);
+      if (m.role === "admin" && role !== "admin" && activeAdmins(t).length <= 1) throw new HttpError(400, "a team needs at least one admin");
+      m.role = role;
+      member = m;
+    });
+    return member;
   }
 
   async revoke(teamId: string, memberId: string) {
-    const team = this.get(teamId);
-    const m = team.members.find((x) => x.id === memberId && !x.revokedAt);
-    if (!m) throw new HttpError(404, `member not found: ${memberId}`);
-    if (m.role === "admin" && activeAdmins(team).length <= 1) throw new HttpError(400, "can't revoke the last admin");
-    m.revokedAt = new Date().toISOString();
-    await this.save(team);
-    return m;
+    let member!: Member;
+    await this.mutate(teamId, (t) => {
+      const m = t.members.find((x) => x.id === memberId && !x.revokedAt);
+      if (!m) throw new HttpError(404, `member not found: ${memberId}`);
+      if (m.role === "admin" && activeAdmins(t).length <= 1) throw new HttpError(400, "can't revoke the last admin");
+      m.revokedAt = new Date().toISOString();
+      member = m;
+    });
+    this.keyCache.delete(member.keyHash);
+    await db.delete(keyPath(member.keyHash));
+    return member;
   }
 }
-
-export const activeMembers = (t: Team) => t.members.filter((m) => !m.revokedAt);
-const activeAdmins = (t: Team) => activeMembers(t).filter((m) => m.role === "admin");
 
 /** Strip secrets before returning over the API. */
 export function publicMember(m: Member) {
@@ -171,13 +204,7 @@ export function publicMember(m: Member) {
   return rest;
 }
 export function publicTeam(t: Team) {
-  return {
-    id: t.id,
-    name: t.name,
-    createdAt: t.createdAt,
-    gitRemote: t.gitRemote ? t.gitRemote.replace(/\/\/[^@/]+@/, "//***@") : undefined,
-    members: t.members.map(publicMember),
-  };
+  return { id: t.id, name: t.name, createdAt: t.createdAt, members: t.members.map(publicMember) };
 }
 
 export const registry = new Registry();

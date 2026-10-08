@@ -1,7 +1,7 @@
 /**
  * maas admin CLI — talks to the admin API.
  *
- *   $env:MAAS_URL="https://<service>.run.app"; $env:MAAS_TOKEN="<admin token or team-admin member key>"
+ *   $env:MAAS_URL="https://api-xxxx-ew.a.run.app"; $env:MAAS_TOKEN="<admin token or team-admin member key>"
  *   npm run admin -- teams
  *   npm run admin -- team:create acme "Acme Inc" chris "Chris"     # prints chris's key
  *   npm run admin -- members acme
@@ -9,7 +9,7 @@
  *   npm run admin -- member:rotate acme alice
  *   npm run admin -- member:role acme alice admin|member
  *   npm run admin -- member:revoke acme alice
- *   npm run admin -- team:remote acme "https://user:token@github.com/acme/memory.git"
+ *   npm run admin -- export acme [dir]                              # markdown snapshot to a local folder
  *   npm run admin -- dream acme
  *   npm run admin -- me
  */
@@ -39,7 +39,7 @@ function printKey(out: any) {
   console.log(`API key: ${out.key}\n`);
   console.log(`Give this to ${out.member.name}. It is shown only once. Connect with:`);
   console.log(`  MCP URL : ${base}/mcp   (header  Authorization: Bearer ${out.key})`);
-  console.log(`  Viewer  : ${base}/view?key=${out.key}\n`);
+  console.log(`  Viewer  : ${base}/view/?key=${out.key}\n`);
 }
 
 const [cmd, ...a] = process.argv.slice(2);
@@ -59,9 +59,21 @@ switch (cmd) {
     printKey(out);
     break;
   }
-  case "team:remote":
-    console.log(await call("PATCH", `/api/teams/${a[0]}`, { gitRemote: a[1] ?? null }));
+  case "export": {
+    // Writes the team's markdown (what this token may see) into a local folder.
+    const [team, dir = `memory-${a[0]}`] = a;
+    if (!team) throw new Error("usage: export <team-id> [dir]");
+    const out = await call("GET", `/api/teams/${team}/files`);
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    for (const [rel, content] of Object.entries(out.files as Record<string, string>)) {
+      const file = path.join(dir, ...rel.split("/"));
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await fs.writeFile(file, content);
+    }
+    console.log(`Exported ${Object.keys(out.files).length} files (head #${out.head}) to ${path.resolve(dir)}`);
     break;
+  }
   case "members": {
     const t = await call("GET", `/api/teams/${a[0]}`);
     for (const m of t.members)
@@ -84,5 +96,5 @@ switch (cmd) {
     console.log(await call("POST", `/api/teams/${a[0]}/dream`));
     break;
   default:
-    console.log("commands: me | teams | team:create | team:remote | members | member:add | member:rotate | member:role | member:revoke | dream");
+    console.log("commands: me | teams | team:create | members | export | member:add | member:rotate | member:role | member:revoke | dream");
 }

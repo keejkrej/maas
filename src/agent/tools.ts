@@ -1,6 +1,6 @@
-import { type Access, privateRoot, zoneOf } from "../access.js";
+import { type Access, privateRoot, SOURCES_DIR, zoneOf } from "../access.js";
 import type { AgentTool } from "../llm.js";
-import type { MemoryRepo } from "../repo.js";
+import type { TeamStore } from "../store.js";
 
 const str = (description: string) => ({ type: "string", description });
 
@@ -13,7 +13,7 @@ function denyWrite(access: Access, rel: string) {
 }
 
 /** Read-only tools, scoped to `access`. */
-export function readTools(repo: MemoryRepo, access: Access): AgentTool[] {
+export function readTools(repo: TeamStore, access: Access): AgentTool[] {
   return [
     {
       name: "list_files",
@@ -70,17 +70,18 @@ export function readTools(repo: MemoryRepo, access: Access): AgentTool[] {
       description: "Open the raw observation behind a citation like [source: obs/<id>]. Only works for observations you have access to.",
       parameters: { type: "object", properties: { id: str("Observation id, e.g. 'obs/k3x9q2'") }, required: ["id"] },
       async run({ id }) {
-        const f = await repo.findSource(id);
-        if (!f) return `No source found for ${id}`;
-        if (!access.canRead(f)) return `Source ${id} belongs to another member and is private.`;
-        return (await repo.readFile(f)) ?? `No source found for ${id}`;
+        const m = access.member;
+        if (!m || !access.canRead(`${SOURCES_DIR}/${m}/x`)) return "Raw observations are not available in this run (they are private to their author).";
+        const s = await repo.getSource(m, id);
+        if (!s) return `No source found for ${id} among your own observations (other members' observations are private).`;
+        return `id: obs/${s.id}\nby: ${s.member}\nkind: ${s.kind}\nscope: ${s.scope}\nreceived: ${s.receivedAt}${s.context ? `\ncontext: ${s.context}` : ""}\n\n${s.content}`;
       },
     },
   ];
 }
 
 /** Write tools for ingest and dream runs. Changes stay uncommitted until the run finishes. */
-export function writeTools(repo: MemoryRepo, access: Access): AgentTool[] {
+export function writeTools(repo: TeamStore, access: Access): AgentTool[] {
   return [
     {
       name: "write_file",
@@ -91,10 +92,10 @@ export function writeTools(repo: MemoryRepo, access: Access): AgentTool[] {
         required: ["path", "content"],
       },
       async run({ path, content }) {
-        const { rel } = repo.resolve(path);
+        const rel = repo.resolve(path);
         const denied = denyWrite(access, rel);
         if (denied) return denied;
-        await repo.writeFile(rel, content);
+        repo.writeFile(rel, content);
         return `Wrote ${rel}`;
       },
     },
@@ -118,7 +119,7 @@ export function writeTools(repo: MemoryRepo, access: Access): AgentTool[] {
         if (count > 1) return `Error: old_text matches ${count} times in ${rel}; include more context.`;
         let next = c.replace(old_text, () => new_text);
         if (new_text === "") next = next.replace(/\n{3,}/g, "\n\n");
-        await repo.writeFile(rel, next);
+        repo.writeFile(rel, next);
         return `Edited ${rel}`;
       },
     },
@@ -135,12 +136,12 @@ export function writeTools(repo: MemoryRepo, access: Access): AgentTool[] {
         required: ["path", "lines"],
       },
       async run({ path, lines, title }) {
-        const { rel } = repo.resolve(path);
+        const rel = repo.resolve(path);
         const denied = denyWrite(access, rel);
         if (denied) return denied;
         const existing = await repo.readFile(rel);
         const base = existing ?? `# ${title || rel.replace(/\.md$/, "").split("/").pop()}\n\n`;
-        await repo.writeFile(rel, base.replace(/\n*$/, "\n") + String(lines).trim() + "\n");
+        repo.writeFile(rel, base.replace(/\n*$/, "\n") + String(lines).trim() + "\n");
         return `Appended to ${rel}${existing === null ? " (new file — link it from the relevant MEMORY.md index or a parent file)" : ""}`;
       },
     },
@@ -151,11 +152,11 @@ export function writeTools(repo: MemoryRepo, access: Access): AgentTool[] {
       async run({ from, to }) {
         const src = await repo.locate(from);
         if (!src) return `Error: file not found: ${from}`;
-        const dst = repo.resolve(to).rel;
+        const dst = repo.resolve(to);
         const denied = denyWrite(access, src) ?? denyWrite(access, dst);
         if (denied) return denied;
-        await repo.writeFile(dst, (await repo.readFile(src)) ?? "");
-        await repo.deleteFile(src);
+        repo.writeFile(dst, (await repo.readFile(src)) ?? "");
+        repo.deleteFile(src);
         return `Moved ${src} -> ${dst}`;
       },
     },
@@ -169,7 +170,7 @@ export function writeTools(repo: MemoryRepo, access: Access): AgentTool[] {
         if (rel === "MEMORY.md") return "Error: MEMORY.md cannot be deleted";
         const denied = denyWrite(access, rel);
         if (denied) return denied;
-        await repo.deleteFile(rel);
+        repo.deleteFile(rel);
         return `Deleted ${rel}`;
       },
     },

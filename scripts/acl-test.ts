@@ -1,24 +1,30 @@
 /**
- * Offline test of the team privacy model (no LLM needed):
- *   npx tsx scripts/acl-test.ts
+ * Offline test of the team privacy model (no LLM, no Firestore — uses the local JSON store):
+ *   npm run acl-test
  */
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
-import { memberAccess, privateDreamAccess, sharedDreamAccess, zoneOf } from "../src/access.js";
-import { commitVisibleTo } from "../src/agent/agent.js";
-import { readTools, writeTools } from "../src/agent/tools.js";
-import { MemoryRepo } from "../src/repo.js";
 
 const dir = await fs.mkdtemp(path.join(os.tmpdir(), "maas-acl-"));
-const repo = new MemoryRepo(path.join(dir, "memory"), "test/bundle", () => undefined);
+process.env.MAAS_STORE = "local";
+process.env.MAAS_DATA_DIR = dir;
+
+const { memberAccess, privateDreamAccess, sharedDreamAccess, zoneOf } = await import("../src/access.js");
+const { commitVisibleTo } = await import("../src/agent/agent.js");
+const { readTools, writeTools } = await import("../src/agent/tools.js");
+const { TeamStore } = await import("../src/store.js");
+
+const repo = new TeamStore("test");
 await repo.init({ "MEMORY.md": "# Memory: Test\n\n## Index\n- [[projects/payments]]\n" });
-await repo.writeFile("projects/payments.md", "# Payments\n- Uses Postgres [by: alice]\n");
-await repo.writeFile("private/alice/MEMORY.md", "# Alice\n- Prefers tabs\n");
-await repo.writeFile("private/bob/MEMORY.md", "# Bob\n- Secret project codename: HUMMINGBIRD\n");
-await repo.writeFile("sources/bob/2026-10-08/abcd1234.md", "bob raw observation HUMMINGBIRD");
+repo.writeFile("projects/payments.md", "# Payments\n- Uses Postgres [by: alice]\n");
+repo.writeFile("private/alice/MEMORY.md", "# Alice\n- Prefers tabs\n");
+repo.writeFile("private/bob/MEMORY.md", "# Bob\n- Secret project codename: HUMMINGBIRD\n");
 await repo.commit("seed");
+const seedSeq = await repo.head();
+await repo.putSource({ id: "abcd1234", member: "bob", kind: "remember", scope: "auto", receivedAt: new Date().toISOString(), content: "bob raw observation HUMMINGBIRD" });
+await repo.putSource({ id: "aaaa1111", member: "alice", kind: "remember", scope: "auto", receivedAt: new Date().toISOString(), content: "alice raw observation about tabs" });
 
 const tool = (tools: any[], name: string) => tools.find((t) => t.name === name)!;
 let passed = 0;
@@ -52,13 +58,15 @@ await ok("cannot read bob's private file", async () => {
 });
 await ok("path traversal is rejected", async () => {
   await assert.rejects(() => tool(ar, "read_file").run({ path: "../../etc/passwd" }));
-  await assert.rejects(() => tool(ar, "read_file").run({ path: "private/alice/../../.git/config" }));
+  assert.match(await tool(ar, "read_file").run({ path: "private/alice/../bob/MEMORY.md" }), /outside your access/);
 });
 await ok("search never returns bob's content (even with sources)", async () => {
   assert.equal(await tool(ar, "search").run({ pattern: "HUMMINGBIRD", include_sources: true }), "No matches.");
+  assert.match(await tool(ar, "search").run({ pattern: "raw observation", include_sources: true }), /alice raw/);
 });
-await ok("cannot open bob's raw source", async () => {
+await ok("cannot open bob's raw source, can open own", async () => {
   assert.match(await tool(ar, "read_source").run({ id: "obs/abcd1234" }), /private/);
+  assert.match(await tool(ar, "read_source").run({ id: "obs/aaaa1111" }), /tabs/);
 });
 await ok("cannot write/delete/move into bob's space or sources", async () => {
   assert.match(await tool(aw, "write_file").run({ path: "private/bob/evil.md", content: "x" }), /may not write/);
@@ -79,6 +87,7 @@ await ok("shared dream sees no private files", async () => {
   const out = await tool(readTools(repo, S), "list_files").run({});
   assert.doesNotMatch(out, /private\//);
   assert.match(await tool(writeTools(repo, S), "write_file").run({ path: "private/alice/x.md", content: "x" }), /may not write/);
+  assert.match(await tool(readTools(repo, S), "read_source").run({ id: "obs/abcd1234" }), /not available/);
 });
 await ok("bob's private dream can read shared but only write private/bob", async () => {
   const P = privateDreamAccess("bob");
@@ -99,11 +108,24 @@ await ok("personal and shared changes land in separate commits", async () => {
   assert.equal(await repo.commit("nothing", () => true), null);
 });
 await ok("diffSince over the shared space excludes private changes", async () => {
-  await repo.writeFile("private/bob/MEMORY.md", "# Bob\n- changed\n");
+  repo.writeFile("private/bob/MEMORY.md", "# Bob\n- changed\n");
   await repo.commit("bob change");
-  const diff = await repo.diffSince(null, [".", ":(exclude)private", ":(exclude)sources", ":(exclude).maas"]);
+  const diff = await repo.diffSince(seedSeq, (rel) => zoneOf(rel).kind === "shared");
   assert.match(diff, /Postgres 17/);
-  assert.doesNotMatch(diff, /HUMMINGBIRD|changed|tabs/);
+  assert.doesNotMatch(diff, /HUMMINGBIRD|changed|tabs|dark mode/);
+});
+await ok("show() filters patches to what the viewer may read", async () => {
+  const [last] = await repo.log(1);
+  assert.equal(await repo.show(last.sha, (f) => memberAccess("alice").canRead(f)).then((s) => /changed/.test(s)), false);
+  assert.match(await repo.show(last.sha, (f) => memberAccess("bob").canRead(f)), /changed/);
+});
+await ok("committed state survives a fresh load; rollback drops uncommitted edits", async () => {
+  repo.writeFile("scratch.md", "# tmp\n");
+  repo.rollback();
+  const fresh = await new TeamStore("test").load();
+  assert.match((await fresh.readFile("projects/payments.md"))!, /Postgres 17/);
+  assert.equal(await fresh.readFile("scratch.md"), null);
+  assert.equal(await repo.readFile("scratch.md"), null);
 });
 
 await fs.rm(dir, { recursive: true, force: true });

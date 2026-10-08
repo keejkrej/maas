@@ -1,7 +1,11 @@
 import express, { type Request, type Response, type Router } from "express";
 import { memberAccess, privateRoot } from "./access.js";
-import { commitVisibleTo, hub, type TeamMemory } from "./agent/agent.js";
-import { activeMembers, registry, type Member } from "./teams.js";
+import * as agent from "./agent/agent.js";
+import type { TeamStore } from "./store.js";
+import { activeMembers, registry, type Member, type Team } from "./teams.js";
+
+// All viewer pages live one level under /view/ and use relative links, so the viewer works
+// both at the root of a domain and behind a path prefix (e.g. a cloudfunctions.net/api URL).
 
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 
@@ -10,9 +14,9 @@ function renderMd(md: string): string {
   let inList = false;
   const inline = (s: string) =>
     esc(s)
-      .replace(/\[\[([^\]]+)\]\]/g, (_, p) => `<a href="/view/file?path=${encodeURIComponent(p)}">[[${p}]]</a>`)
+      .replace(/\[\[([^\]]+)\]\]/g, (_, p) => `<a href="file?path=${encodeURIComponent(p)}">[[${p}]]</a>`)
       .replace(/\[(source|added|updated|until|by):([^\]]*)\]/g, (m) => `<span class="meta">${m}</span>`)
-      .replace(/obs\/([a-z0-9]{6,8})/g, (m, id) => `<a class="meta" href="/view/source?id=${id}">${m}</a>`)
+      .replace(/obs\/([a-z0-9]{6,8})/g, (m, id) => `<a class="meta" href="source?id=${id}">${m}</a>`)
       .replace(/`([^`]+)`/g, "<code>$1</code>")
       .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
   for (const line of md.split("\n")) {
@@ -32,25 +36,28 @@ function renderMd(md: string): string {
 }
 
 interface Ctx {
-  tm: TeamMemory;
+  team: Team;
   member: Member;
+  store: TeamStore;
 }
 
 async function ctxOf(req: Request): Promise<Ctx> {
   const a = req.maas;
   if (a?.kind !== "member") throw new Error("unauthenticated");
-  return { tm: await hub.get(a.team.id), member: a.member };
+  // Re-read the team so roster changes made on this page show up immediately.
+  const team = await registry.get(a.team.id);
+  return { team, member: a.member, store: await agent.readStore(team.id) };
 }
 
-async function page({ tm, member }: Ctx, title: string, body: string) {
+async function page({ team, member, store }: Ctx, title: string, body: string) {
   const access = memberAccess(member.id);
-  const files = await tm.repo.listFiles({ access });
+  const files = await store.listFiles({ access });
   const mine = privateRoot(member.id) + "/";
   const shared = files.filter((f) => !f.startsWith("private/"));
   const personal = files.filter((f) => f.startsWith(mine));
-  const meta = await tm.meta();
-  const pending = tm.pendingObservations().length;
-  const link = (f: string, label = f) => `<a href="/view/file?path=${encodeURIComponent(f)}">${esc(label)}</a>`;
+  const [meta, st] = await Promise.all([agent.meta(team.id), agent.status(team.id)]);
+  const pending = st.pending.length;
+  const link = (f: string, label = f) => `<a href="file?path=${encodeURIComponent(f)}">${esc(label)}</a>`;
   return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(title)} · maas</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
@@ -70,11 +77,11 @@ table{border-collapse:collapse;width:100%} td,th{border-bottom:1px solid var(--b
 button,input,select{font:inherit;padding:5px 10px;border-radius:6px;border:1px solid var(--bd);background:transparent;color:var(--fg)}
 button{cursor:pointer} .key{font:13px ui-monospace,monospace;padding:10px;border:1px dashed var(--acc);border-radius:8px;word-break:break-all}
 </style></head><body>
-<nav><a href="/view"><b>🧠 ${esc(tm.team.name)}</b></a>
-<div class="stat">signed in as <b>${esc(member.name)}</b> (${esc(member.id)}${member.role === "admin" ? ", admin" : ""}) · <a style="display:inline" href="/logout">log out</a><br>
-${meta.totalObservations} observations · ${meta.totalDreams} dreams<br>agent: ${esc(tm.status.busy ?? "idle")}${pending ? ` · ${pending} pending` : ""}</div>
-<h3>Views</h3><a href="/view">Team MEMORY.md</a><a href="/view/file?path=${encodeURIComponent(mine + "MEMORY.md")}">My MEMORY.md</a>
-<a href="/view/log">History</a><a href="/view/inbox">Inbox</a><a href="/view/team">Team &amp; keys</a>
+<nav><a href="./"><b>🧠 ${esc(team.name)}</b></a>
+<div class="stat">signed in as <b>${esc(member.name)}</b> (${esc(member.id)}${member.role === "admin" ? ", admin" : ""}) · <a style="display:inline" href="../logout">log out</a><br>
+${meta.totalObservations} observations · ${meta.totalDreams} dreams<br>agent: ${esc(st.busy ?? "idle")}${pending ? ` · ${pending} pending` : ""}</div>
+<h3>Views</h3><a href="./">Team MEMORY.md</a><a href="file?path=${encodeURIComponent(mine + "MEMORY.md")}">My MEMORY.md</a>
+<a href="log">History</a><a href="inbox">Inbox</a><a href="team">Team &amp; keys</a>
 <h3>Team (${shared.length})</h3>${shared.map((f) => link(f)).join("")}
 <h3>Personal — only you (${personal.length})</h3><div class="priv">${personal.map((f) => link(f, f.slice(mine.length))).join("") || '<span class="stat">empty</span>'}</div>
 </nav><main>${body}</main></body></html>`;
@@ -93,63 +100,62 @@ const h =
 export function viewerRouter(): Router {
   const r = express.Router();
 
-  r.get("/", h(async (_req, res, ctx) => {
-    const md = (await ctx.tm.repo.readFile("MEMORY.md")) ?? "";
+  r.get("/", h(async (req, res, ctx) => {
+    // "/view" → "/view/" so relative links resolve under /view/.
+    if (!req.originalUrl.split("?")[0].endsWith("/")) return void res.redirect("view/");
+    const md = (await ctx.store.readFile("MEMORY.md")) ?? "";
     res.send(await page(ctx, "MEMORY.md", `<div class="stat">MEMORY.md <span class="badge">team</span></div>${renderMd(md)}`));
   }));
 
   r.get("/file", h(async (req, res, ctx) => {
     const access = memberAccess(ctx.member.id);
     const p = String(req.query.path ?? "");
-    const rel = await ctx.tm.repo.locate(p).catch(() => null);
+    const rel = await ctx.store.locate(p).catch(() => null);
     if (!rel || !access.canRead(rel)) return void res.send(await page(ctx, p, `<p>Not found: ${esc(p)}</p>`));
-    const c = (await ctx.tm.repo.readFile(rel)) ?? "";
+    const c = (await ctx.store.readFile(rel)) ?? "";
     const target = rel.replace(/\.md$/, "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const bl = [...new Set((await ctx.tm.repo.search(`\\[\\[${target}(\\.md)?\\]\\]`, { access })).map((b) => b.path))].filter((x) => x !== rel);
+    const bl = [...new Set((await ctx.store.search(`\\[\\[${target}(\\.md)?\\]\\]`, { access })).map((b) => b.path))].filter((x) => x !== rel);
     const badge = rel.startsWith("private/") ? `<span class="badge priv">personal</span>` : `<span class="badge">team</span>`;
     res.send(
       await page(
         ctx,
         rel,
         `<div class="stat">${esc(rel)} ${badge}</div>${renderMd(c)}` +
-          (bl.length ? `<h3>Backlinks</h3><ul>${bl.map((b) => `<li><a href="/view/file?path=${encodeURIComponent(b)}">${esc(b)}</a></li>`).join("")}</ul>` : "") +
+          (bl.length ? `<h3>Backlinks</h3><ul>${bl.map((b) => `<li><a href="file?path=${encodeURIComponent(b)}">${esc(b)}</a></li>`).join("")}</ul>` : "") +
           `<details><summary class="stat">raw</summary><pre>${esc(c)}</pre></details>`,
       ),
     );
   }));
 
   r.get("/source", h(async (req, res, ctx) => {
-    const f = await ctx.tm.repo.findSource(String(req.query.id ?? ""));
-    const ok = f && memberAccess(ctx.member.id).canRead(f);
-    const body = !f
-      ? `<p>No such observation.</p>`
-      : ok
-        ? `<div class="stat">${esc(f)}</div><pre>${esc((await ctx.tm.repo.readFile(f)) ?? "")}</pre>`
-        : `<p>This observation was contributed by another member; raw observations are private to their author.</p>`;
+    // Raw observations live under the author's own subtree, so a member can only ever fetch their own.
+    const s = await ctx.store.getSource(ctx.member.id, String(req.query.id ?? ""));
+    const body = s
+      ? `<div class="stat">obs/${esc(s.id)} · ${esc(s.receivedAt)} · ${esc(s.client ?? "")} · scope: ${esc(s.scope)}${s.context ? ` · context: ${esc(s.context)}` : ""}</div><pre>${esc(s.content)}</pre>`
+      : `<p>Not found. Raw observations are private to the member who sent them.</p>`;
     res.send(await page(ctx, "source", body));
   }));
 
   r.get("/log", h(async (_req, res, ctx) => {
-    const log = await ctx.tm.visibleLog(ctx.member.id, 100);
+    const log = await agent.visibleLog(ctx.team.id, ctx.member.id, 100);
     const rows = log
       .map((c) => {
-        const files = c.files.filter((f) => !f.startsWith(".maas/"));
-        const priv = files.some((f) => f.startsWith("private/") || f.startsWith("sources/"));
+        const priv = c.files.some((f) => f.startsWith("private/"));
         return (
-          `<tr><td><a href="/view/commit?sha=${c.sha}"><code>${c.sha}</code></a><br><span class="stat">${esc(c.date.slice(0, 16).replace("T", " "))}</span></td>` +
-          `<td>${priv ? '<span class="badge priv">personal</span> ' : ""}${esc(c.message.split("\n")[0])}<br><span class="stat">${esc(files.join(", "))}</span></td></tr>`
+          `<tr><td><a href="commit?sha=${c.sha}"><code>${c.sha}</code></a><br><span class="stat">${esc(c.date.slice(0, 16).replace("T", " "))}</span></td>` +
+          `<td>${priv ? '<span class="badge priv">personal</span> ' : ""}${esc(c.message.split("\n")[0])}<br><span class="stat">${esc(c.files.join(", "))}</span></td></tr>`
         );
       })
       .join("");
-    res.send(await page(ctx, "History", `<h2>History</h2><form method="post" action="/view/dream"><button>🌙 Dream now</button></form><br><table>${rows}</table>`));
+    res.send(await page(ctx, "History", `<h2>History</h2><form method="post" action="dream"><button>🌙 Dream now</button></form><br><table>${rows}</table>`));
   }));
 
   r.get("/commit", h(async (req, res, ctx) => {
     const sha = String(req.query.sha ?? "");
-    const all = await ctx.tm.repo.log(500);
-    const c = all.find((x) => x.sha.startsWith(sha) || sha.startsWith(x.sha));
-    if (!c || !commitVisibleTo(c, ctx.member.id)) return void res.send(await page(ctx, "commit", `<p>Not found.</p>`));
-    const diff = await ctx.tm.repo.show(c.sha, [".", ":(exclude).maas"]);
+    const c = /^[0-9a-f]{4,40}$/i.test(sha) ? await ctx.store.getCommit(sha) : null;
+    if (!c || !agent.commitVisibleTo(c, ctx.member.id)) return void res.send(await page(ctx, "commit", `<p>Not found.</p>`));
+    const access = memberAccess(ctx.member.id);
+    const diff = await ctx.store.show(c.sha, (f) => access.canRead(f));
     const html = esc(diff)
       .split("\n")
       .map((l) => (l.startsWith("+") && !l.startsWith("+++") ? `<span class="d-add">${l}</span>` : l.startsWith("-") && !l.startsWith("---") ? `<span class="d-del">${l}</span>` : l))
@@ -158,21 +164,28 @@ export function viewerRouter(): Router {
   }));
 
   r.get("/inbox", h(async (_req, res, ctx) => {
-    const mine = ctx.tm.pendingObservations(ctx.member.id);
-    const others = ctx.tm.pendingObservations().length - mine.length;
-    const recent = ctx.tm.recentResults(ctx.member.id);
+    const st = await agent.status(ctx.team.id);
+    const mine = st.pending.filter((o) => o.member === ctx.member.id);
+    const others = st.pending.length - mine.length;
+    const recent = await agent.recentRuns(ctx.team.id, ctx.member.id);
     res.send(
       await page(
         ctx,
         "Inbox",
         `<h2>Your pending observations (${mine.length})</h2>` +
-          (mine.length ? `<table>${mine.map((o) => `<tr><td><code>obs/${o.id}</code><br><span class="stat">${esc(o.client ?? "")} · ${o.scope}</span></td><td>${esc(o.content)}</td></tr>`).join("")}</table>` : `<p class="stat">Nothing waiting.</p>`) +
-          (others ? `<p class="stat">+ ${others} from teammates.</p>` : "") +
-          (ctx.tm.status.lastError ? `<p class="d-del">Last error: ${esc(ctx.tm.status.lastError)}</p>` : "") +
-          `<h2>Recent agent runs (since boot)</h2><table>${recent
+          (mine.length
+            ? `<table>${mine.map((o) => `<tr><td><code>obs/${o.id}</code><br><span class="stat">${esc(o.client ?? "")} · ${o.kind} · ${o.scope}${o.attempts ? ` · retry ${o.attempts}` : ""}</span></td><td>${esc(o.content)}</td></tr>`).join("")}</table>`
+            : `<p class="stat">Nothing waiting.</p>`) +
+          (others ? `<p class="stat">+ ${others} from teammates / system.</p>` : "") +
+          (st.lastError ? `<p class="d-del">Last error: ${esc(st.lastError)}</p>` : "") +
+          `<h2>Recent agent runs</h2><table>${recent
             .map(
               (r) =>
-                `<tr><td>${esc(r.member ?? "dream")}</td><td>${r.teamMessage ? `<b>team:</b> ${esc(r.teamMessage)}<br>` : ""}${r.personalMessage ? `<b>personal:</b> ${esc(r.personalMessage)}<br>` : ""}<span class="stat">${r.commits.map((c) => c.sha).join(", ")}</span></td></tr>`,
+                `<tr><td>${esc(r.kind === "dream" ? "🌙 dream" : r.member)}<br><span class="stat">${esc(r.receivedAt.slice(0, 16).replace("T", " "))} · ${r.status}</span></td>` +
+                `<td>${r.kind === "dream" || r.member === ctx.member.id ? `<span class="stat">${esc(r.content.slice(0, 200))}</span><br>` : ""}` +
+                `${r.result?.teamMessage ? `<b>team:</b> ${esc(r.result.teamMessage)}<br>` : ""}${r.result?.personalMessage ? `<b>personal:</b> ${esc(r.result.personalMessage)}<br>` : ""}` +
+                `${r.error ? `<span class="d-del">${esc(r.error)}</span><br>` : ""}` +
+                `<span class="stat">${(r.result?.commits ?? []).map((c) => `<a href="commit?sha=${c.sha}">${c.sha}</a>`).join(", ")}</span></td></tr>`,
             )
             .join("")}</table>`,
       ),
@@ -180,29 +193,29 @@ export function viewerRouter(): Router {
   }));
 
   r.post("/dream", h(async (_req, res, ctx) => {
-    ctx.tm.dream(`requested by ${ctx.member.id} via viewer`, true).catch((e) => console.error("[dream]", e));
-    res.redirect("/view/log");
+    await agent.requestDream(ctx.team.id, `requested by ${ctx.member.id} via viewer`, true);
+    res.redirect("inbox");
   }));
 
   // ----- team & keys -----
 
   const teamPage = async (ctx: Ctx, notice = "") => {
-    const team = ctx.tm.team;
+    const team = ctx.team;
     const isAdmin = ctx.member.role === "admin";
     const rows = activeMembers(team)
       .map(
         (m) =>
           `<tr><td><b>${esc(m.name)}</b><br><span class="stat">${esc(m.id)}</span></td><td>${m.role}</td><td><code>${esc(m.keyPrefix)}…</code></td><td class="stat">${m.createdAt.slice(0, 10)}</td><td>` +
-          (m.id === ctx.member.id || isAdmin ? `<form method="post" action="/view/team/rotate" style="display:inline"><input type="hidden" name="id" value="${esc(m.id)}"><button>Rotate key</button></form> ` : "") +
+          (m.id === ctx.member.id || isAdmin ? `<form method="post" action="team-rotate" style="display:inline"><input type="hidden" name="id" value="${esc(m.id)}"><button>Rotate key</button></form> ` : "") +
           (isAdmin && m.id !== ctx.member.id
-            ? `<form method="post" action="/view/team/role" style="display:inline"><input type="hidden" name="id" value="${esc(m.id)}"><input type="hidden" name="role" value="${m.role === "admin" ? "member" : "admin"}"><button>${m.role === "admin" ? "Make member" : "Make admin"}</button></form> ` +
-              `<form method="post" action="/view/team/revoke" style="display:inline" onsubmit="return confirm('Revoke ${esc(m.id)}? Their key stops working immediately. Their personal memory is kept.')"><input type="hidden" name="id" value="${esc(m.id)}"><button>Revoke</button></form>`
+            ? `<form method="post" action="team-role" style="display:inline"><input type="hidden" name="id" value="${esc(m.id)}"><input type="hidden" name="role" value="${m.role === "admin" ? "member" : "admin"}"><button>${m.role === "admin" ? "Make member" : "Make admin"}</button></form> ` +
+              `<form method="post" action="team-revoke" style="display:inline" onsubmit="return confirm('Revoke ${esc(m.id)}? Their key stops working immediately. Their personal memory is kept.')"><input type="hidden" name="id" value="${esc(m.id)}"><button>Revoke</button></form>`
             : "") +
           `</td></tr>`,
       )
       .join("");
     const add = isAdmin
-      ? `<h3>Add a member</h3><form method="post" action="/view/team/add"><input name="id" placeholder="id (e.g. alice)" required pattern="[a-z0-9][a-z0-9-]*"> <input name="name" placeholder="Display name"> <select name="role"><option value="member">member</option><option value="admin">admin</option></select> <button>Create key</button></form>`
+      ? `<h3>Add a member</h3><form method="post" action="team-add"><input name="id" placeholder="id (e.g. alice)" required pattern="[a-z0-9][a-z0-9-]*"> <input name="name" placeholder="Display name"> <select name="role"><option value="member">member</option><option value="admin">admin</option></select> <button>Create key</button></form>`
       : `<p class="stat">Ask a team admin to add members.</p>`;
     return page(ctx, "Team", `<h2>${esc(team.name)} <span class="stat">(${esc(team.id)})</span></h2>${notice}<table><tr><th>Member</th><th>Role</th><th>Key</th><th>Added</th><th></th></tr>${rows}</table>${add}`);
   };
@@ -212,30 +225,32 @@ export function viewerRouter(): Router {
 
   r.get("/team", h(async (_req, res, ctx) => void res.send(await teamPage(ctx))));
 
-  r.post("/team/add", h(async (req, res, ctx) => {
+  r.post("/team-add", h(async (req, res, ctx) => {
     if (ctx.member.role !== "admin") throw new Error("only team admins can add members");
-    const out = await registry.addMember(ctx.tm.teamId, { id: String(req.body.id ?? "").trim(), name: req.body.name, role: req.body.role });
+    const out = await registry.addMember(ctx.team.id, { id: String(req.body.id ?? "").trim(), name: req.body.name, role: req.body.role });
+    ctx.team = await registry.get(ctx.team.id);
     res.send(await teamPage(ctx, keyNotice(out.member.name, out.key)));
   }));
 
-  r.post("/team/rotate", h(async (req, res, ctx) => {
+  r.post("/team-rotate", h(async (req, res, ctx) => {
     const id = String(req.body.id ?? "");
     if (id !== ctx.member.id && ctx.member.role !== "admin") throw new Error("forbidden");
-    const out = await registry.rotateKey(ctx.tm.teamId, id);
+    const out = await registry.rotateKey(ctx.team.id, id);
     if (id === ctx.member.id) res.clearCookie("maas_key");
+    ctx.team = await registry.get(ctx.team.id);
     res.send(await teamPage(ctx, keyNotice(out.member.name, out.key) + (id === ctx.member.id ? `<p class="stat">Your old key no longer works; update your tools and log in again.</p>` : "")));
   }));
 
-  r.post("/team/role", h(async (req, res, ctx) => {
+  r.post("/team-role", h(async (req, res, ctx) => {
     if (ctx.member.role !== "admin") throw new Error("forbidden");
-    await registry.setRole(ctx.tm.teamId, String(req.body.id), req.body.role === "admin" ? "admin" : "member");
-    res.redirect("/view/team");
+    await registry.setRole(ctx.team.id, String(req.body.id), req.body.role === "admin" ? "admin" : "member");
+    res.redirect("team");
   }));
 
-  r.post("/team/revoke", h(async (req, res, ctx) => {
+  r.post("/team-revoke", h(async (req, res, ctx) => {
     if (ctx.member.role !== "admin") throw new Error("forbidden");
-    await registry.revoke(ctx.tm.teamId, String(req.body.id));
-    res.redirect("/view/team");
+    await registry.revoke(ctx.team.id, String(req.body.id));
+    res.redirect("team");
   }));
 
   return r;

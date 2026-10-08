@@ -3,3 +3,6 @@ dist/
 .env
 .data/
 *.log
+.firebase/
+firebase-debug.log
+memory-*/

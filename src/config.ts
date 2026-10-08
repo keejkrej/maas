@@ -1,7 +1,8 @@
 import path from "node:path";
 
 function env(name: string, fallback?: string): string | undefined {
-  const v = process.env[name];
+  // Trim: secrets set through a shell pipe often carry a trailing newline.
+  const v = process.env[name]?.trim();
   return v === undefined || v === "" ? fallback : v;
 }
 

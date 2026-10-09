@@ -1,25 +1,31 @@
 {
   "name": "maas",
   "version": "0.1.0",
-  "description": "Memory as a Service: an MCP endpoint backed by a memory agent that curates a git repo of markdown.",
+  "description": "Memory as a Service: an MCP endpoint backed by a memory agent that curates a team's markdown memory (Firebase + Ollama Cloud).",
   "type": "module",
-  "main": "dist/index.js",
+  "main": "dist/functions.js",
   "engines": {
-    "node": ">=22"
+    "node": "22"
   },
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "prebuild": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "smoke": "tsx scripts/smoke.ts"
+    "deploy": "firebase deploy",
+    "logs": "firebase functions:log",
+    "smoke": "tsx scripts/smoke.ts",
+    "acl-test": "tsx scripts/acl-test.ts",
+    "admin": "tsx scripts/admin.ts"
   },
   "license": "MIT",
   "dependencies": {
-    "@google-cloud/storage": "^8.3.0",
-    "@google/genai": "^2.28.0",
     "@modelcontextprotocol/sdk": "^1.32.1",
+    "diff": "^9.0.0",
     "express": "^5.2.1",
+    "firebase-admin": "^14.5.0",
+    "firebase-functions": "^7.4.0",
     "zod": "^4.6.5"
   },
   "devDependencies": {

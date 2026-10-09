@@ -1,42 +1,56 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { agent } from "./agent/agent.js";
-import { config } from "./config.js";
-import { repo } from "./repo.js";
+import { memberAccess, privateRoot } from "./access.js";
+import * as agent from "./agent/agent.js";
+import { activeMembers, type Member, type Team } from "./teams.js";
 
-const INSTRUCTIONS = `This server is ${config.ownerName}'s long-term memory, shared across all of their AI tools.
-Behind it is a memory agent that curates a git repo of markdown: you don't write records, you tell the agent what you learned and it decides what to keep, where to file it, and how to reconcile it with what it already knows.
-
-How to use it:
-- At the start of a task, call memory_context to load the core memory (MEMORY.md).
-- When you need specific knowledge (preferences, people, project context, past decisions, how-tos), call recall with a natural-language question.
-- Whenever you learn something durable — a preference, a correction from the user, a decision and its rationale, a fact about a person or project, a gotcha that cost time — call remember with a self-contained note. Don't ask permission for routine memories. Don't send secrets.
-- If the user says something you remembered is wrong or should be forgotten, call forget.`;
-
-function text(t: string) {
-  return { content: [{ type: "text" as const, text: t }] };
+export interface McpCtx {
+  team: Team;
+  member: Member;
+  client: string;
 }
 
-/** A fresh MCP server per request (stateless Streamable HTTP). `client` identifies the calling tool. */
-export function buildMcpServer(client: string) {
-  const server = new McpServer({ name: "maas", version: "0.1.0" }, { instructions: INSTRUCTIONS });
+function instructions({ team, member }: McpCtx) {
+  return `This server is the shared long-term memory of the "${team.name}" team (${activeMembers(team).length} members). You are connected as ${member.name} (${member.id}).
+Behind it is a memory agent that curates a folder of markdown. You don't write records: you tell the agent what you learned, and it decides what to keep, where to file it, and whether it is team knowledge (visible to all members) or personal (visible only to ${member.id}).
+
+How to use it:
+- At the start of a task, call memory_context to load the team's core memory and ${member.id}'s personal memory.
+- When you need knowledge (team conventions, project context, decisions, who owns what, the user's preferences), call recall with a question.
+- Whenever you learn something durable — a decision and its rationale, a convention, a gotcha that cost time, a preference or correction from the user — call remember with a self-contained note. Don't ask permission for routine memories. Never send secrets.
+- If something remembered is wrong or outdated, call forget.`;
+}
+
+const text = (t: string) => ({ content: [{ type: "text" as const, text: t }] });
+
+function describe(item: agent.InboxItem | null, id: string) {
+  if (!item) return `obs/${id} is queued; the agent is still working on it.`;
+  if (item.status === "failed") return `obs/${id} failed to integrate: ${item.error}`;
+  const r = item.result!;
+  const files = [...new Set(r.commits.flatMap((c) => c.files))];
+  return `Integrated obs/${id}.\nTeam: ${r.teamMessage}\nPersonal: ${r.personalMessage ?? "-"}\n` + (files.length ? `Files: ${files.join(", ")}` : "No memory files changed.");
+}
+
+/** A fresh MCP server per request (stateless Streamable HTTP), bound to the authenticated member. */
+export function buildMcpServer(ctx: McpCtx) {
+  const { team, member, client } = ctx;
+  const access = memberAccess(member.id);
+  const server = new McpServer({ name: "maas", version: "0.3.0" }, { instructions: instructions(ctx) });
 
   server.registerTool(
     "memory_context",
     {
       title: "Load core memory",
       description:
-        "Return MEMORY.md, the short entry point to the user's memory (core facts + index of topics). Call once at the start of a session or task.",
+        "Return the team's MEMORY.md and your personal MEMORY.md (short entry points with core facts and an index of topics). Call once at the start of a session or task.",
       inputSchema: {},
       annotations: { readOnlyHint: true },
     },
     async () => {
-      const memory = (await repo.readFile("MEMORY.md")) ?? "(empty)";
-      const pending = agent.pendingObservations().length;
+      const c = await agent.memoryContext(team.id, member.id);
       return text(
-        memory +
-          `\n\n---\nUse recall for details behind any [[link]].` +
-          (pending ? ` (${pending} observation(s) are still being integrated by the memory agent.)` : ""),
+        `# Team memory (${team.name})\n\n${c.team.trim()}\n\n` +
+          `# Personal memory (${member.name} — only you can see this)\n\n${c.personal?.trim() ?? "(empty)"}\n\n---\nUse recall for details behind any [[link]].`,
       );
     },
   );
@@ -46,30 +60,20 @@ export function buildMcpServer(client: string) {
     {
       title: "Tell the memory agent something",
       description:
-        "Send an observation to the memory agent. Write it as a self-contained note in natural language (who/what/why, with absolute dates). " +
-        "Batch several related facts into one call. The agent dedupes, files and reconciles it with existing memory in the background. " +
-        "Good: 'User prefers pnpm over npm in all JS projects; they corrected me when I used npm install.' Never include secrets.",
+        "Send an observation to the team's memory agent. Write a self-contained note (who/what/why, absolute dates). Batch related facts into one call. " +
+        "The agent dedupes, files and reconciles it, and decides per fact whether it is team knowledge or personal to you (override with scope). " +
+        "Example: 'We decided to move the billing service from REST to gRPC because of latency; Alice owns the migration, target 2026-11-30.' Never include secrets.",
       inputSchema: {
-        observation: z.string().min(3).describe("What you learned, as a self-contained note"),
-        context: z
-          .string()
-          .optional()
-          .describe("Optional provenance: project/repo, session or conversation link, what you were doing"),
-        wait: z
-          .boolean()
-          .optional()
-          .describe("Wait (up to ~90s) for the agent to integrate it and return what changed. Default false."),
+        observation: z.string().min(3).max(20_000).describe("What you learned, as a self-contained note"),
+        scope: z.enum(["auto", "team", "personal"]).optional().describe("auto (default): agent decides per fact. team: share with the team. personal: keep private to you."),
+        context: z.string().max(2000).optional().describe("Optional provenance: project/repo, session or link, what you were doing"),
+        wait: z.boolean().optional().describe("Wait (up to ~90s) for the agent to integrate it and report what changed. Default false."),
       },
     },
-    async ({ observation, context, wait }) => {
-      const obs = await agent.enqueue({ content: observation, source: context, client });
+    async ({ observation, scope, context, wait }) => {
+      const obs = await agent.enqueue(team.id, { member: member.id, content: observation, scope: scope ?? "auto", context, client });
       if (!wait) return text(`Received by the memory agent as obs/${obs.id}. It will be integrated shortly.`);
-      const r = await agent.waitFor(obs.id, 90_000);
-      if (!r) return text(`obs/${obs.id} is queued; the agent is still working on it.`);
-      return text(
-        `Integrated obs/${obs.id}.\nAgent: ${r.message}\n` +
-          (r.commit ? `Commit ${r.commit.sha} touched: ${r.commit.files.filter((f) => !f.startsWith("sources/") && !f.startsWith(".maas/")).join(", ") || "(sources only)"}` : ""),
-      );
+      return text(describe(await agent.waitFor(team.id, obs.id, 90_000), obs.id));
     },
   );
 
@@ -78,32 +82,31 @@ export function buildMcpServer(client: string) {
     {
       title: "Ask the memory agent",
       description:
-        "Ask the memory agent a natural-language question. It searches the memory repo, follows links, and answers with the relevant facts and their sources. " +
-        "Examples: 'What are the user's coding style preferences for TypeScript?', 'What do I know about the payments project deadline?'",
+        "Ask the memory agent a natural-language question. It searches team memory and your personal memory, follows links, and answers with the facts, who contributed them, and sources. " +
+        "Examples: 'How do we deploy the payments service?', 'Who knows the most about our Kafka setup?', 'How does the user like PR descriptions written?'",
       inputSchema: {
-        question: z.string().min(3).describe("What you want to know"),
-        context: z.string().optional().describe("Optional: what you're working on, so the agent can pick what's relevant"),
+        question: z.string().min(3).max(4000).describe("What you want to know"),
+        context: z.string().max(4000).optional().describe("Optional: what you're working on, so the agent can pick what's relevant"),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ question, context }) => text(await agent.recall(question, context)),
+    async ({ question, context }) => text(await agent.recall(team, member, question, context)),
   );
 
   server.registerTool(
     "forget",
     {
       title: "Correct or remove a memory",
-      description: "Ask the memory agent to delete or correct something it remembers (e.g. the user said it's wrong or outdated).",
+      description: "Ask the memory agent to delete or correct something (e.g. it's wrong or outdated). Applies to team memory and your personal memory.",
       inputSchema: {
-        what: z.string().min(3).describe("What should be forgotten or corrected, and the correct information if any"),
-        reason: z.string().optional().describe("Why (e.g. 'user said this is outdated')"),
+        what: z.string().min(3).max(4000).describe("What should be forgotten or corrected, and the correct information if any"),
+        reason: z.string().max(2000).optional().describe("Why (e.g. 'user said this is outdated')"),
       },
       annotations: { destructiveHint: true },
     },
     async ({ what, reason }) => {
-      const obs = await agent.enqueue({ content: what, kind: "forget", source: reason, client });
-      const r = await agent.waitFor(obs.id, 90_000);
-      return text(r ? `Done (obs/${obs.id}): ${r.message}` : `Queued as obs/${obs.id}; the agent will apply it shortly.`);
+      const obs = await agent.enqueue(team.id, { member: member.id, content: what, kind: "forget", context: reason, client });
+      return text(describe(await agent.waitFor(team.id, obs.id, 90_000), obs.id));
     },
   );
 
@@ -111,14 +114,16 @@ export function buildMcpServer(client: string) {
     "memory_read",
     {
       title: "Read a memory file",
-      description: "Read a file from the memory repo directly, e.g. a [[link]] from MEMORY.md ('people/priya' or 'projects/payments.md'). Omit path to list all files.",
+      description: `Read a memory file directly, e.g. a [[link]] ('projects/payments' or '${privateRoot(member.id)}/preferences.md'). Omit path to list all files you can see.`,
       inputSchema: { path: z.string().optional().describe("Repo-relative path or wiki link; omit to list files") },
       annotations: { readOnlyHint: true },
     },
     async ({ path }) => {
-      if (!path) return text((await repo.listFiles()).join("\n") || "(no files)");
-      const c = await repo.readFile(path);
-      return text(c ?? `Not found: ${path}`);
+      const store = await agent.readStore(team.id);
+      if (!path) return text((await store.listFiles({ access })).join("\n") || "(no files)");
+      const rel = await store.locate(path).catch(() => null);
+      if (!rel || !access.canRead(rel)) return text(`Not found: ${path}`);
+      return text((await store.readFile(rel)) ?? `Not found: ${path}`);
     },
   );
 
@@ -126,20 +131,16 @@ export function buildMcpServer(client: string) {
     "memory_log",
     {
       title: "Recent memory changes",
-      description: "Show the memory agent's recent commits (what it remembered, merged or cleaned up), plus queue status.",
+      description: "Show recent changes by the memory agent that you can see (team changes plus your personal ones), and queue status.",
       inputSchema: { limit: z.number().int().min(1).max(100).optional().describe("Number of commits (default 15)") },
       annotations: { readOnlyHint: true },
     },
     async ({ limit }) => {
-      const log = await repo.log(limit ?? 15);
-      const meta = await agent.meta();
-      const lines = log.map(
-        (c) =>
-          `${c.sha} ${c.date.slice(0, 16).replace("T", " ")}  ${c.message.split("\n")[0]}\n    ${c.files.filter((f) => !f.startsWith(".maas/")).join(", ")}`,
-      );
+      const [log, m, st] = await Promise.all([agent.visibleLog(team.id, member.id, limit ?? 15), agent.meta(team.id), agent.status(team.id)]);
+      const lines = log.map((c) => `${c.sha} ${c.date.slice(0, 16).replace("T", " ")}  ${c.message.split("\n")[0]}\n    ${c.files.join(", ")}`);
       return text(
-        `Agent: ${agent.status.busy ?? "idle"} · pending: ${agent.pendingObservations().length} · observations: ${meta.totalObservations} · dreams: ${meta.totalDreams} · last dream: ${meta.lastDreamAt ?? "never"}` +
-          (agent.status.lastError ? `\nLast error: ${agent.status.lastError}` : "") +
+        `Team ${team.id} · agent: ${st.busy ?? "idle"} · pending: ${st.pending.length} · observations: ${m.totalObservations} · dreams: ${m.totalDreams} · last dream: ${m.lastDreamAt ?? "never"}` +
+          (st.lastError ? `\nLast error: ${st.lastError}` : "") +
           `\n\n${lines.join("\n")}`,
       );
     },
@@ -149,12 +150,12 @@ export function buildMcpServer(client: string) {
     "dream",
     {
       title: "Consolidate memory now",
-      description: "Trigger a dreaming pass: the agent merges duplicates, resolves contradictions, prunes stale entries and records cross-session patterns. Runs in the background.",
+      description: "Trigger a dreaming pass over team memory and changed personal spaces: merge duplicates, resolve contradictions, prune stale entries, record patterns. Runs in the background.",
       inputSchema: {},
     },
     async () => {
-      agent.dream(`requested by ${client}`).catch((e) => console.error("[dream]", e));
-      return text("Dream started. Check memory_log in a minute or two to see what changed.");
+      await agent.requestDream(team.id, `requested by ${member.id} via ${client}`, true);
+      return text("Dream queued. Check memory_log in a minute or two to see what changed.");
     },
   );
 
